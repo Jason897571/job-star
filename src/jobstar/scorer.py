@@ -1,8 +1,11 @@
-"""维度打分器。纯函数：不写库、不碰浏览器，可对历史岗位批量回放。
+"""维度打分器。
 
 两条约束在代码里强制执行，不依赖 prompt 遵守：
 1. 某维度没有引用到真实存在的卡片 → 该维度记 0 分
 2. 某维度只引用了「弱」证据卡片 → 该维度分数封顶 WEAK_EVIDENCE_CAP
+
+`score()` 是纯函数：不写库、不碰浏览器，可对历史岗位批量回放。
+模块里另外三个函数（`save_score`/`save_failure`/`load_score`）负责读写 scores 表。
 """
 
 from __future__ import annotations
@@ -84,6 +87,10 @@ def _clean_dimension(
     ids = raw.get("card_ids") or []
     if isinstance(ids, str):
         ids = [ids]
+    elif not isinstance(ids, (list, tuple)):
+        # 非字符串的标量（如 3、true）不可能是真实存在的卡片 id，
+        # 直接当空列表处理，交给下面的过滤逻辑判定为无证据
+        ids = []
     valid = tuple(str(i) for i in ids if str(i) in card_index)
 
     reason = str(raw.get("reason") or "")
@@ -96,9 +103,15 @@ def _clean_dimension(
     value = max(0.0, min(100.0, value))
 
     if not valid:
-        return DimensionScore(name, 0.0, (), reason, gap or "无证据卡片支撑")
+        # 强制清零时不能沿用模型给出的 reason/gap——那是为非零分数写的话术，
+        # 原样展示会让人误以为「0 分但看起来命中了」。这里改写成明确说明零分成因，
+        # 模型原话只作为附加信息弱化呈现。
+        note = "无证据卡片支撑，已强制记 0 分"
+        if gap and gap != "无":
+            note = f"{note}（模型给出的缺口说明：{gap}）"
+        return DimensionScore(name, 0.0, (), "", note)
 
-    if all(card_index[i].strength is Strength.WEAK for i in valid):
+    if all(card_index[i].strength == Strength.WEAK for i in valid):
         value = min(value, WEAK_EVIDENCE_CAP)
 
     return DimensionScore(name, value, valid, reason, gap)
@@ -118,6 +131,11 @@ def score(
     )
     data = call_json(system=SYSTEM, user=user, tier="strong")
     raw_dims = data.get("dimensions") or {}
+    if not isinstance(raw_dims, dict):
+        # call_json 只保证顶层是 dict，dimensions 的形状不受保证——
+        # 模型可能返回 [{"name": "skills", ...}] 这种 list-of-objects。
+        # 按「未返回任何维度」处理，走后面统一的缺失/清零路径，而不是让 AttributeError 炸穿。
+        raw_dims = {}
 
     card_index = {c.id: c for c in cards}
     dimensions = tuple(
@@ -175,7 +193,8 @@ def save_failure(conn: sqlite3.Connection, job_id: str, error: str) -> None:
         "INSERT INTO scores (job_id, total, dimensions, scorer_version, error) "
         "VALUES (?, NULL, '[]', ?, ?) "
         "ON CONFLICT(job_id) DO UPDATE SET "
-        "total=NULL, error=excluded.error, scored_at=datetime('now')",
+        "total=NULL, dimensions='[]', scorer_version=excluded.scorer_version, "
+        "error=excluded.error, scored_at=datetime('now')",
         (job_id, SCORER_VERSION, error),
     )
     conn.execute(
