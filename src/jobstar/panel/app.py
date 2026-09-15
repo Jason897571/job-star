@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from jobstar import actions
@@ -24,6 +24,36 @@ from jobstar.models import DIMENSION_LABELS
 STATIC = Path(__file__).parent / "static"
 
 app = FastAPI(title="jobstar 面板")
+
+PANEL_HEADER = "X-Jobstar-Panel"
+
+
+def require_panel_request(request: Request) -> None:
+    """CSRF 防护（review finding 1）。
+
+    面板绑定在 127.0.0.1，挡得住远程攻击者，但挡不住同一台机器、同一个
+    浏览器里另一个页面发起的跨源请求：一个不带自定义头的简单 POST 不需要
+    CORS 预检，浏览器照样会把它发出去——即使那个恶意页面读不到响应内容，
+    请求本身已经在服务端产生了副作用（比如把一条消息批准发送）。这正是
+    这个面板存在的意义要防住的事：只有面板自己的按钮点击才能批准发送。
+
+    这里要求所有变更状态的路由都带上一个只有面板自己的 JS 会发送的自定义
+    请求头。浏览器对「携带自定义头的跨源 fetch」要求先发一次 CORS 预检
+    (OPTIONS)，而这个服务器没有配置 CORS、不会满足预检条件，恶意页面的
+    真实请求根本到不了下面的处理函数——所以自定义头本身不需要保密，它挡
+    的是浏览器的同源策略机制，不是靠猜不到。
+
+    额外校验 Origin：如果浏览器带了 Origin 头（同源请求在部分浏览器里会
+    省略它，另一些浏览器会照样带上本面板自己的源，两种都要放行），但它
+    不是本面板自己的源，说明这个请求源头本来就不对，直接拒绝。
+    """
+    if request.headers.get(PANEL_HEADER) != "1":
+        raise HTTPException(403, "缺少面板请求头，拒绝执行（疑似跨站请求）")
+    origin = request.headers.get("origin")
+    if origin is not None:
+        expected = f"{request.url.scheme}://{request.headers.get('host', '')}"
+        if origin != expected:
+            raise HTTPException(403, "请求来源不是本面板，拒绝执行")
 
 
 def get_db() -> sqlite3.Connection:
@@ -135,7 +165,9 @@ def queue(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     return {"items": items, "uncertain": uncertain}
 
 
-@app.post("/api/actions/{action_id}/approve")
+@app.post(
+    "/api/actions/{action_id}/approve", dependencies=[Depends(require_panel_request)]
+)
 def approve_action(
     action_id: int,
     body: dict = Body(default={}),
@@ -160,7 +192,9 @@ def approve_action(
     return {"ok": True}
 
 
-@app.post("/api/actions/{action_id}/skip")
+@app.post(
+    "/api/actions/{action_id}/skip", dependencies=[Depends(require_panel_request)]
+)
 def skip_action(
     action_id: int, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
@@ -241,7 +275,7 @@ def label_next(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     return dict(row)
 
 
-@app.post("/api/label")
+@app.post("/api/label", dependencies=[Depends(require_panel_request)])
 def write_label(
     body: dict = Body(...), conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
@@ -292,7 +326,7 @@ def read_settings(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     return {key: get_setting(conn, key) for key in SETTING_DEFAULTS}
 
 
-@app.put("/api/settings")
+@app.put("/api/settings", dependencies=[Depends(require_panel_request)])
 def write_settings(
     body: dict = Body(...), conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
@@ -300,5 +334,8 @@ def write_settings(
     if unknown:
         raise HTTPException(400, f"未知配置项：{unknown}")
     for key, value in body.items():
-        set_setting(conn, key, value)
+        try:
+            set_setting(conn, key, value)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     return {"ok": True}

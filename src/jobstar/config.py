@@ -97,9 +97,84 @@ def get_setting(conn: sqlite3.Connection, key: str) -> Any:
     return json.loads(row["value"])
 
 
+def _is_number(value: Any) -> bool:
+    """True/False 是 int 的子类，但这里的字段都不该接受布尔值。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_str_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def validate_setting_value(key: str, value: Any) -> None:
+    """写入前校验值的*形状*（get_setting 只查过键名，没查过值本身）。
+
+    review finding 2：`PUT /api/settings` 曾经只挡未知键，不挡值的形状——
+    `{"dimension_weights": "oops"}` 能写进去，等到打分器里
+    `weights.get(d.name, 0.0)` 才炸成 AttributeError，那时人工早就忘了是
+    哪次编辑引入的。这里把校验挪到写入的时刻，配 set_setting 调用，让
+    CLI 和面板共用同一份规则，而不是只有面板路由自己挡。
+
+    不认识的键仍然由调用方（get_setting/set_setting）抛 KeyError；这里
+    只负责“键是认识的，但值不对”的情况，一律抛 ValueError。
+    """
+    if key == "dimension_weights":
+        if not isinstance(value, dict):
+            raise ValueError(f"{key} 必须是字典（维度名 -> 权重）")
+        from jobstar.models import DIMENSIONS
+
+        if set(value) != set(DIMENSIONS):
+            raise ValueError(f"{key} 的键必须恰好是 {sorted(DIMENSIONS)}")
+        for dim, weight in value.items():
+            if not _is_number(weight) or weight < 0:
+                raise ValueError(f"{key}.{dim} 必须是非负数字，实际是 {weight!r}")
+        if sum(value.values()) == 0:
+            raise ValueError(f"{key} 不能全部为 0（会导致所有总分恒为 0）")
+
+    elif key == "gate_rules":
+        if not isinstance(value, dict):
+            raise ValueError(f"{key} 必须是字典")
+        if "city_whitelist" in value and not _is_str_list(value["city_whitelist"]):
+            raise ValueError(f"{key}.city_whitelist 必须是字符串列表")
+        if "company_blacklist" in value and not _is_str_list(
+            value["company_blacklist"]
+        ):
+            raise ValueError(f"{key}.company_blacklist 必须是字符串列表")
+        for sub in ("salary_min", "years_min", "years_max"):
+            if sub in value and value[sub] is not None and not _is_number(value[sub]):
+                raise ValueError(f"{key}.{sub} 必须是数字或 null")
+        if "degree_hard" in value and not isinstance(value["degree_hard"], bool):
+            raise ValueError(f"{key}.degree_hard 必须是布尔值")
+        # 未知子键（例如 my_degree）允许——它们在别处（pipeline._gate_rules）
+        # 被合并进这份规则，不属于 gate_rules 自身的 schema。
+
+    elif key == "score_threshold":
+        if value is not None and not (_is_number(value) and 0 <= value <= 100):
+            raise ValueError(f"{key} 必须是 0-100 的数字，或 null（冷启动期）")
+
+    elif key == "daily_greeting_limit":
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{key} 必须是非负整数")
+
+    elif key == "my_degree":
+        from jobstar.gate import DEGREE_ORDER
+
+        if value not in DEGREE_ORDER:
+            raise ValueError(f"{key} 必须是 {sorted(DEGREE_ORDER)} 之一")
+
+    elif key == "my_years":
+        if not _is_number(value) or value < 0:
+            raise ValueError(f"{key} 必须是非负数字")
+
+    elif key in ("last_collect_error", "last_collect_at"):
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{key} 必须是字符串或 null")
+
+
 def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
     if key not in SETTING_DEFAULTS:
         raise KeyError(f"未知配置项 {key!r}，可用项：{sorted(SETTING_DEFAULTS)}")
+    validate_setting_value(key, value)
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",

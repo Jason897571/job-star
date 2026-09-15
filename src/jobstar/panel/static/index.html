@@ -36,7 +36,12 @@
 
 <script>
 const $ = (s) => document.querySelector(s);
-const api = (p, o) => fetch(p, o).then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)));
+// 每个请求都带上 X-Jobstar-Panel 头：这是唯一能让浏览器对携带自定义头的
+// 跨源 fetch 强制先走 CORS 预检的办法，而这个服务器不满足预检条件——跨站
+// 的恶意页面发不出携带这个头的请求，写在这一处就不会有调用点漏掉（见
+// panel/app.py 的 require_panel_request）。
+const api = (p, o) => fetch(p, { ...o, headers: { ...(o && o.headers), "X-Jobstar-Panel": "1" } })
+  .then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)));
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 // url 来自采集器抓取的 <a href>（见 collector/boss.py），不是本系统自己
 // 生成的值——esc() 只挡得住 HTML 转义，挡不住 javascript: 这类协议。这里

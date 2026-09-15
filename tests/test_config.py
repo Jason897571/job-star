@@ -48,3 +48,24 @@ def test_get_settings_rejects_unknown_backend(monkeypatch):
     monkeypatch.setenv("JOBSTAR_LLM_BACKEND", "openai")
     with pytest.raises(ValueError):
         get_settings()
+
+
+# --- review finding 2：值的形状校验要放在 set_setting 本身，而不是只在面板
+# 路由里挡——这样 CLI（或任何未来的调用方）直接调 set_setting 也一样受保护，
+# 不需要每个调用点自己重复校验。
+
+
+def test_set_setting_rejects_bad_value_shape(conn):
+    """`set_setting` 本身要抛 ValueError，不能指望调用方（比如面板路由）
+    自己去校验值的形状——CLI 也是直接调 set_setting，同样要被挡住。"""
+    with pytest.raises(ValueError):
+        set_setting(conn, "dimension_weights", "oops")
+
+
+def test_set_setting_accepts_legitimate_values(conn):
+    """现有代码路径（CLI、pipeline、executor 的测试）实际写过的合法值都
+    不能被新加的校验误伤。"""
+    set_setting(conn, "daily_greeting_limit", 25)
+    set_setting(conn, "score_threshold", None)
+    set_setting(conn, "score_threshold", 70)
+    set_setting(conn, "gate_rules", {"city_whitelist": ["杭州", "上海"], "salary_min": 30})

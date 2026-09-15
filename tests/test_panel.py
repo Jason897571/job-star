@@ -2,8 +2,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from jobstar.actions import PENDING, SENDING, SKIPPED, approve, enqueue, mark_sending
+from jobstar.config import SETTING_DEFAULTS
 from jobstar.db import get_conn, init_db
-from jobstar.panel.app import app, get_db
+from jobstar.panel.app import PANEL_HEADER, app, get_db
+
+# 面板自己的 JS（见 static/index.html 的 api() 助手）在每个请求上都带这个
+# 头；下面除了专门测试「没带头会被拒」的用例外，都用它模拟面板本身发出
+# 的请求。
+PANEL_HEADERS = {PANEL_HEADER: "1"}
 
 
 @pytest.fixture()
@@ -67,7 +73,9 @@ def test_approve_moves_action_and_can_rewrite(client):
         client.conn, type="send_greeting", job_id="j1", payload={"greeting": "原稿"}
     )
     resp = client.post(
-        f"/api/actions/{action_id}/approve", json={"greeting": "改写后的稿子"}
+        f"/api/actions/{action_id}/approve",
+        json={"greeting": "改写后的稿子"},
+        headers=PANEL_HEADERS,
     )
     assert resp.status_code == 200
     row = client.conn.execute(
@@ -81,7 +89,7 @@ def test_skip_moves_action(client):
     action_id = enqueue(
         client.conn, type="send_greeting", job_id="j1", payload={"greeting": "稿"}
     )
-    client.post(f"/api/actions/{action_id}/skip")
+    client.post(f"/api/actions/{action_id}/skip", headers=PANEL_HEADERS)
     row = client.conn.execute(
         "SELECT status FROM actions WHERE id=?", (action_id,)
     ).fetchone()
@@ -98,7 +106,9 @@ def test_approve_rejects_invalid_transition(client):
         (action_id,),
     )
     client.conn.commit()
-    resp = client.post(f"/api/actions/{action_id}/approve", json={})
+    resp = client.post(
+        f"/api/actions/{action_id}/approve", json={}, headers=PANEL_HEADERS
+    )
     assert resp.status_code == 409
 
 
@@ -137,13 +147,19 @@ def test_label_next_returns_unlabeled_scored_job(client):
 
 
 def test_label_next_returns_null_when_all_labeled(client):
-    client.post("/api/label", json={"job_id": "j1", "would_apply": True})
+    client.post(
+        "/api/label", json={"job_id": "j1", "would_apply": True}, headers=PANEL_HEADERS
+    )
     assert client.get("/api/label/next").json() == {"job_id": None}
 
 
 def test_label_is_idempotent(client):
-    client.post("/api/label", json={"job_id": "j1", "would_apply": True})
-    client.post("/api/label", json={"job_id": "j1", "would_apply": False})
+    client.post(
+        "/api/label", json={"job_id": "j1", "would_apply": True}, headers=PANEL_HEADERS
+    )
+    client.post(
+        "/api/label", json={"job_id": "j1", "would_apply": False}, headers=PANEL_HEADERS
+    )
     row = client.conn.execute("SELECT would_apply FROM labels WHERE job_id='j1'").fetchone()
     assert row["would_apply"] == 0
 
@@ -158,8 +174,12 @@ def test_threshold_endpoint_reports_both_groups(client):
         "VALUES ('j2', 41.0, '[]', 'v1')"
     )
     client.conn.commit()
-    client.post("/api/label", json={"job_id": "j1", "would_apply": True})
-    client.post("/api/label", json={"job_id": "j2", "would_apply": False})
+    client.post(
+        "/api/label", json={"job_id": "j1", "would_apply": True}, headers=PANEL_HEADERS
+    )
+    client.post(
+        "/api/label", json={"job_id": "j2", "would_apply": False}, headers=PANEL_HEADERS
+    )
     body = client.get("/api/threshold").json()
     assert body["would_apply"]["count"] == 1
     assert body["would_apply"]["min"] == 82.0
@@ -168,14 +188,20 @@ def test_threshold_endpoint_reports_both_groups(client):
 
 
 def test_settings_roundtrip(client):
-    client.put("/api/settings", json={"daily_greeting_limit": 10, "score_threshold": 70})
+    client.put(
+        "/api/settings",
+        json={"daily_greeting_limit": 10, "score_threshold": 70},
+        headers=PANEL_HEADERS,
+    )
     body = client.get("/api/settings").json()
     assert body["daily_greeting_limit"] == 10
     assert body["score_threshold"] == 70
 
 
 def test_settings_rejects_unknown_key(client):
-    resp = client.put("/api/settings", json={"不存在的项": 1})
+    resp = client.put(
+        "/api/settings", json={"不存在的项": 1}, headers=PANEL_HEADERS
+    )
     assert resp.status_code == 400
 
 
@@ -195,7 +221,7 @@ def test_skip_on_sending_row_gives_friendly_message(client):
     )
     approve(client.conn, action_id)
     mark_sending(client.conn, action_id)
-    resp = client.post(f"/api/actions/{action_id}/skip")
+    resp = client.post(f"/api/actions/{action_id}/skip", headers=PANEL_HEADERS)
     assert resp.status_code == 409
     assert "来不及跳过" in resp.json()["detail"]
     row = client.conn.execute(
@@ -214,7 +240,9 @@ def test_approve_on_sending_row_gives_friendly_message(client):
     )
     approve(client.conn, action_id)
     mark_sending(client.conn, action_id)
-    resp = client.post(f"/api/actions/{action_id}/approve", json={})
+    resp = client.post(
+        f"/api/actions/{action_id}/approve", json={}, headers=PANEL_HEADERS
+    )
     assert resp.status_code == 409
     assert "来不及" in resp.json()["detail"]
 
@@ -270,3 +298,177 @@ def test_queue_surfaces_uncertain_rows_separately_from_items(client):
     assert row["title"] == "AI 后端工程师"
     assert row["url"] == "https://x/job_detail/j1~.html"
     assert "人工到 Boss 对话列表核实" in row["error"]
+
+
+# --- review finding 1：CSRF 防护。面板绑定在 127.0.0.1，挡得住远程攻击者，
+# 但挡不住同一浏览器里另一个页面发起的跨源简单请求（不带自定义头的
+# fetch 不需要 CORS 预检）。下面证明每条变更状态的路由都要求
+# X-Jobstar-Panel 头，并且请求即使带了这个头，若 Origin 头存在且不是本
+# 面板自己的源，也照样被拒。
+
+
+def test_approve_without_panel_header_is_rejected_and_row_unchanged(client):
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "稿"}
+    )
+    resp = client.post(f"/api/actions/{action_id}/approve", json={})
+    assert resp.status_code == 403
+    row = client.conn.execute(
+        "SELECT status FROM actions WHERE id=?", (action_id,)
+    ).fetchone()
+    assert row["status"] == PENDING
+
+
+def test_skip_without_panel_header_is_rejected_and_row_unchanged(client):
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "稿"}
+    )
+    resp = client.post(f"/api/actions/{action_id}/skip")
+    assert resp.status_code == 403
+    row = client.conn.execute(
+        "SELECT status FROM actions WHERE id=?", (action_id,)
+    ).fetchone()
+    assert row["status"] == PENDING
+
+
+def test_label_without_panel_header_is_rejected(client):
+    resp = client.post("/api/label", json={"job_id": "j1", "would_apply": True})
+    assert resp.status_code == 403
+    row = client.conn.execute(
+        "SELECT * FROM labels WHERE job_id='j1'"
+    ).fetchone()
+    assert row is None
+
+
+def test_settings_without_panel_header_is_rejected(client):
+    resp = client.put("/api/settings", json={"daily_greeting_limit": 1})
+    assert resp.status_code == 403
+    body = client.get("/api/settings").json()
+    assert body["daily_greeting_limit"] == SETTING_DEFAULTS["daily_greeting_limit"]
+
+
+def test_approve_with_panel_header_succeeds(client):
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "稿"}
+    )
+    resp = client.post(
+        f"/api/actions/{action_id}/approve", json={}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 200
+    row = client.conn.execute(
+        "SELECT status FROM actions WHERE id=?", (action_id,)
+    ).fetchone()
+    assert row["status"] == "approved"
+
+
+def test_mutating_request_with_foreign_origin_is_rejected_even_with_header(client):
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "稿"}
+    )
+    resp = client.post(
+        f"/api/actions/{action_id}/approve",
+        json={},
+        headers={**PANEL_HEADERS, "origin": "https://evil.example"},
+    )
+    assert resp.status_code == 403
+    row = client.conn.execute(
+        "SELECT status FROM actions WHERE id=?", (action_id,)
+    ).fetchone()
+    assert row["status"] == PENDING
+
+
+def test_mutating_request_with_own_origin_is_accepted(client):
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "稿"}
+    )
+    resp = client.post(
+        f"/api/actions/{action_id}/approve",
+        json={},
+        headers={**PANEL_HEADERS, "origin": "http://testserver"},
+    )
+    assert resp.status_code == 200
+
+
+# --- review finding 2：PUT /api/settings 只校验键名认不认识，从不校验值的
+# 形状。下面证明每个坏值都在写入时被 400 挡下，并且命名了出问题的键；
+# 同时证明现有测试用过的合法值都还能正常写入。
+
+
+def test_settings_rejects_non_mapping_dimension_weights(client):
+    resp = client.put(
+        "/api/settings", json={"dimension_weights": "oops"}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 400
+    assert "dimension_weights" in resp.json()["detail"]
+    body = client.get("/api/settings").json()
+    assert body["dimension_weights"] == SETTING_DEFAULTS["dimension_weights"]
+
+
+def test_settings_rejects_dimension_weights_missing_a_dimension(client):
+    incomplete = dict(SETTING_DEFAULTS["dimension_weights"])
+    del incomplete["bonus"]
+    resp = client.put(
+        "/api/settings",
+        json={"dimension_weights": incomplete},
+        headers=PANEL_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert "dimension_weights" in resp.json()["detail"]
+
+
+def test_settings_rejects_dimension_weights_with_non_numeric_value(client):
+    bad = dict(SETTING_DEFAULTS["dimension_weights"])
+    bad["skills"] = "很多"
+    resp = client.put(
+        "/api/settings", json={"dimension_weights": bad}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 400
+    assert "dimension_weights" in resp.json()["detail"]
+
+
+def test_settings_rejects_all_zero_dimension_weights(client):
+    zeros = {d: 0 for d in SETTING_DEFAULTS["dimension_weights"]}
+    resp = client.put(
+        "/api/settings", json={"dimension_weights": zeros}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 400
+    assert "dimension_weights" in resp.json()["detail"]
+
+
+def test_settings_rejects_out_of_range_score_threshold(client):
+    resp = client.put(
+        "/api/settings", json={"score_threshold": 150}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 400
+    assert "score_threshold" in resp.json()["detail"]
+
+
+def test_settings_rejects_negative_daily_greeting_limit(client):
+    resp = client.put(
+        "/api/settings", json={"daily_greeting_limit": -1}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 400
+    assert "daily_greeting_limit" in resp.json()["detail"]
+
+
+def test_settings_rejects_gate_rules_with_bad_city_whitelist(client):
+    bad_rules = {**SETTING_DEFAULTS["gate_rules"], "city_whitelist": "杭州"}
+    resp = client.put(
+        "/api/settings", json={"gate_rules": bad_rules}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 400
+    assert "gate_rules" in resp.json()["detail"]
+
+
+def test_settings_still_accepts_legitimate_values(client):
+    """覆盖现有测试和场景里实际写过的合法值，确保校验没有误伤它们。"""
+    resp = client.put(
+        "/api/settings",
+        json={
+            "daily_greeting_limit": 10,
+            "score_threshold": 70,
+            "gate_rules": {"city_whitelist": ["杭州", "上海"], "salary_min": 30},
+        },
+        headers=PANEL_HEADERS,
+    )
+    assert resp.status_code == 200
