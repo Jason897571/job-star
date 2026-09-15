@@ -1,14 +1,22 @@
 import random
+import sqlite3
 import statistics
+import subprocess
 
 import pytest
 
 from jobstar import actions
-from jobstar.actions import APPROVED, FAILED, SENT, SKIPPED, approve, enqueue, skip
+from jobstar.actions import APPROVED, FAILED, SENDING, SENT, SKIPPED, approve, enqueue, skip
 from jobstar.collector import boss
 from jobstar.config import set_setting
 from jobstar.db import get_conn, init_db
-from jobstar.executor import ExecutionReport, _build_send_script, human_delay, run_queue
+from jobstar.executor import (
+    ExecutionReport,
+    _build_send_script,
+    human_delay,
+    run_queue,
+    send_greeting,
+)
 
 
 @pytest.fixture()
@@ -389,3 +397,194 @@ def test_send_script_compiles_and_round_trips_payload():
     first_two_lines = "\n".join(script.splitlines()[:2])
     exec(first_two_lines, ns)
     assert ns["args"] == {"url": url, "text": text}
+
+
+# --- Fix round 2 -----------------------------------------------------------
+#
+# 下面这批测试都通过 monkeypatch 掉 `shutil.which`/`subprocess.run`（跟
+# tests/test_collector_boss.py::test_run_script_wraps_timeout_into_collect_error
+# 同一种手法）来伪造 browser-harness 子进程的退出码/stdout/stderr，从头到尾
+# 不落地任何真实浏览器动作、不驱动 Chrome、不打开 Boss 直聘——`send_fn`
+# 这次传的是真的 `send_greeting`，但它调用的 `boss.run_script` 内部的
+# `subprocess.run` 已经被替换成一个纯 Python 假函数。
+
+
+def test_login_wall_on_failure_path_surfaces_and_aborts_run(conn, monkeypatch):
+    """Finding 1 的直接回归：登录墙特征串出现在**非零退出码**脚本的 stdout
+    里（典型场景：session 过期 → new_tab(job_url) 落在登录页 → 找不到「立即
+    沟通」按钮 → raise SystemExit → 退出码非零）。
+
+    修复前：boss.run_script 在这条路径上只把 CollectError(f"...退出码...")
+    抛出去，stdout（含登录墙特征串）被直接丢弃，_guard_login 从未被调用；
+    这次失败会被当成普通「这一条消息发送失败」，mark_failed 之后继续跑下一
+    行——这条测试就是要证明修复前这里是坏的：report.login_required 应该是
+    True，但修复前恒为 False。
+    """
+    _approved(conn, "aaa")
+    id_b = _approved(conn, "bbb")
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/browser-harness")
+
+    login_page_dump = (
+        "###PAGEINFO###{'url': 'https://www.zhipin.com/web/user/?ka=header-login'}\n"
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout=login_page_dump,
+            stderr='SystemExit: 找不到「立即沟通」按钮',
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    report = run_queue(conn, send_fn=send_greeting, sleep_fn=lambda _: None)
+
+    assert report.login_required is True
+    row_b = conn.execute("SELECT status FROM actions WHERE id=?", (id_b,)).fetchone()
+    assert row_b["status"] == APPROVED, "登录墙触发之后，bbb 从未被尝试"
+
+
+def test_login_marker_in_successful_send_output_does_not_mark_failed(conn, monkeypatch):
+    """Finding 1 / 5：登录墙特征串（裸词 "login"）命中的是「立即沟通」按钮
+    之前打印的 PAGEINFO/BODY 摘要，和 SENT_OK 在同一段 stdout 里——如果这次
+    发送最终确认成功，绝不能让这次误判把已经送达的消息标记成失败。"""
+    aid = _approved(conn, "j1")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/browser-harness")
+
+    stdout_with_marker = (
+        "###PAGEINFO###{'url': 'https://www.zhipin.com/job_detail/j1~.html'}\n"
+        "###BODY###完善简历后可直接登录/login 查看更多福利\n"
+        "###CLICKED###\n"
+        "SENT_OK\n"
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=stdout_with_marker, stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    report = run_queue(conn, send_fn=send_greeting, sleep_fn=lambda _: None)
+
+    assert report.sent == 1
+    assert report.failed == 0
+    assert report.login_required is False
+    row = conn.execute("SELECT status FROM actions WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == SENT
+
+
+def test_post_click_failure_leaves_row_sending_and_counts_uncertain(conn, monkeypatch):
+    """Finding 2：点击发送按钮之后才失败（气泡还没渲染完/选择器猜错/
+    close_tab 报错等，脚本一律以非零退出码收场），不能被 mark_failed——那样
+    会退配额，也允许人工在「消息可能已发出」的情况下重新批准，酿成给同一
+    个真人重复发送。行必须原地留在 sending，quota 仍然算它一份，且不可再
+    approve()。"""
+    aid = _approved(conn, "j1")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/browser-harness")
+
+    stdout_after_click = "###PAGEINFO###{}\n###CLICKED###\n"
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout=stdout_after_click,
+            stderr="SystemExit: 发送后最新消息未包含文案前缀，怀疑发送失败",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    report = run_queue(conn, send_fn=send_greeting, sleep_fn=lambda _: None)
+
+    assert report.uncertain == 1
+    assert report.failed == 0
+    row = conn.execute("SELECT status, error FROM actions WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == SENDING, "点击之后才失败：消息可能已发出，不能标记 failed"
+    assert "消息可能已发出，请人工到 Boss 对话列表核实后再决定" in row["error"]
+
+    assert actions.sent_today(conn) == 1, "配额仍然被这一行占用"
+
+    with pytest.raises(actions.InvalidTransition):
+        approve(conn, aid)  # sending 不允许被 approve 当来源状态，不可再批准
+
+
+def test_pre_click_failure_marks_failed_as_before(conn, monkeypatch):
+    """点击发送按钮之前的失败（例如「立即沟通」按钮本身没找到）什么都没
+    发生，行为必须和修复前一样：mark_failed，不计入 uncertain。"""
+    aid = _approved(conn, "j1")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/browser-harness")
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="###PAGEINFO###{}\n",
+            stderr='SystemExit: 找不到「立即沟通」按钮',
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    report = run_queue(conn, send_fn=send_greeting, sleep_fn=lambda _: None)
+
+    assert report.failed == 1
+    assert report.uncertain == 0
+    row = conn.execute("SELECT status FROM actions WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == FAILED
+
+
+def test_claim_failure_does_not_consume_a_sleep(conn, tmp_path):
+    """Minor 3：人工在两次真实发送之间把某一行跳过（认领失败），执行器不
+    该为这次失败的认领白白睡一次 5-600s——延迟只应该出现在两次真实发送
+    之间。三行 a/b/c：a 发送时顺带把 b 标记跳过（模拟人工中途操作面板），
+    b 的认领因此失败，c 仍然正常发送；a、c 这两次真实发送之间只应该有
+    1 次延迟，而不是按队列里的行数（含认领失败的 b）算出来的 2 次——修复
+    前的 `if index > 0: sleep_fn(...)` 会在 b、c 前各睡一次。"""
+    _approved(conn, "a")
+    id_b = _approved(conn, "b")
+    _approved(conn, "c")
+
+    other = get_conn(tmp_path / "t.db")
+    try:
+        delays = []
+        sent = []
+
+        def send_fn(url, text):
+            if url.endswith("/a~.html"):
+                skip(other, id_b)  # 模拟人工在 a 发送之后、b 轮到之前点了跳过
+            sent.append(url)
+
+        report = run_queue(conn, send_fn=send_fn, sleep_fn=delays.append)
+
+        assert report.skipped == 1
+        assert len(sent) == 2
+        assert len(delays) == 1, "b 认领失败不该消耗一次延迟"
+    finally:
+        other.close()
+
+
+def test_operational_error_from_bookkeeping_is_recorded_and_loop_continues(
+    conn, monkeypatch
+):
+    """Minor 4：db.py 用默认 5s busy timeout，本地面板并发写同一个数据库
+    文件时 mark_sent 可能撞上 sqlite3.OperationalError（database is locked）。
+    这类异常必须被记进 report.errors，而不是让 run_queue 直接崩掉——那样
+    report 和队列里剩下的行会被一起丢掉，正是上一轮修复设法消除的失败形状。
+    消息本身已经真的发出去了（send_fn 正常返回），记账写失败不改变这一点。
+    """
+    _approved(conn, "a")
+    _approved(conn, "b")
+
+    def flaky_mark_sent(c, action_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(actions, "mark_sent", flaky_mark_sent)
+
+    report = run_queue(conn, send_fn=lambda u, t: None, sleep_fn=lambda _: None)
+
+    assert report.sent == 2, "发送本身没有失败，记账写失败不能少算"
+    assert any("locked" in e for e in report.errors)
+    rows = conn.execute("SELECT status FROM actions").fetchall()
+    assert {r["status"] for r in rows} == {SENDING}, "记账没写进去，行原地留在 sending"

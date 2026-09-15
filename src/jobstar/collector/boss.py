@@ -84,7 +84,15 @@ class LoginRequired(RuntimeError):
 
 
 class CollectError(RuntimeError):
-    pass
+    """采集/执行失败。`stdout` 携带失败发生前脚本已经写出的标准输出（可能
+    是空字符串）——退出码非零时消息本身只塞了 stderr 前 800 字节，stdout
+    会被直接丢弃；调用方如果需要在失败路径上也做点什么（例如
+    executor.send_greeting 在这条路径上跑登录墙检测），得从这里把 stdout
+    带出去，而不是让它随异常一起消失。"""
+
+    def __init__(self, message: str, stdout: str = "") -> None:
+        super().__init__(message)
+        self.stdout = stdout
 
 
 def run_script(script: str, timeout: int = 180) -> str:
@@ -102,10 +110,15 @@ def run_script(script: str, timeout: int = 180) -> str:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise CollectError(f"browser-harness 执行超时（>{timeout}s）") from exc
+        # 超时时 Popen 可能已经攒下部分 stdout（见 subprocess.TimeoutExpired
+        # 文档），一并带出去，而不是让调用方在这条路径上永远拿不到 stdout。
+        raise CollectError(
+            f"browser-harness 执行超时（>{timeout}s）", stdout=exc.stdout or ""
+        ) from exc
     if proc.returncode != 0:
         raise CollectError(
-            f"browser-harness 退出码 {proc.returncode}：{proc.stderr[:800]}"
+            f"browser-harness 退出码 {proc.returncode}：{proc.stderr[:800]}",
+            stdout=proc.stdout,
         )
     return proc.stdout
 

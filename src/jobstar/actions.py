@@ -19,6 +19,15 @@ failed   → skipped（彻底放弃，例如岗位已下架）
 sending 是「消息可能已经发出、但还没确认」的诚实中间态，不会被自动回收：
 进程被打断（Ctrl-C、宕机）留在 sending 的行，下一轮执行器读不到它（它已经
 不是 approved），因此不会被重发；面板把它留给人工核实。
+
+sending 现在承载两种含义：一种是上面说的「正在发送中」（进程被打断，行
+就停在这里）；另一种是「已经跑完，但结果不确定，等人工核实」——执行器
+点击发送按钮之后才失败（例如我方消息气泡渲染慢/选择器猜错/关闭标签页报
+错），消息很可能已经真的发出去了。这种情况不会被 mark_failed：那样会把
+配额退回去（sent_today 不再计它），也允许人工在「消息可能已发出」的情况
+下重新批准，酿成给同一个真人重复发送。这类行改由 note_uncertain 写一条
+人工核实提示到 error 列，状态原地留在 sending——反正 sending 本来就不允
+许被 approve/skip 当来源状态，行天然就不可再批准。
 """
 
 from __future__ import annotations
@@ -200,6 +209,20 @@ def mark_failed(conn: sqlite3.Connection, action_id: int, error: str) -> None:
         "status=?, error=?",
         (FAILED, error),
     )
+
+
+def note_uncertain(conn: sqlite3.Connection, action_id: int, error: str) -> None:
+    """记录一次「发送结果不确定」的说明，不做状态迁移——行留在 sending。
+
+    区别于 mark_failed：这里不经过 `_atomic_transition`（它要求给一个目标
+    状态；这里没有目标状态，只是把 error 列换成人工核实提示），也不做 CAS
+    校验。调用者手里的这一行是它自己 `mark_sending` 认领来的：sending 不
+    在 `_ALLOWED_FROM[APPROVED]`/`_ALLOWED_FROM[SKIPPED]` 里，别的连接无法
+    把一行 sending 的动作抢去 approve/skip，此刻不存在别的写入者会跟这次
+    UPDATE 竞争。
+    """
+    conn.execute("UPDATE actions SET error=? WHERE id=?", (error, action_id))
+    conn.commit()
 
 
 def list_by_status(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:

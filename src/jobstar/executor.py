@@ -29,6 +29,7 @@ class ExecutionReport:
     sent: int = 0
     failed: int = 0
     skipped: int = 0
+    uncertain: int = 0
     quota_hit: bool = False
     login_required: bool = False
     errors: list[str] = field(default_factory=list)
@@ -76,6 +77,13 @@ _CONFIRM_SENT_JS = (
     "});"
 )
 
+# 点击发送按钮之后、读回确认之前打印的标记。发送按钮点没点到，和「点到了
+# 之后有没有确认成功」是两件性质完全不同的事——前者什么都没发生，后者
+# 消息很可能已经真的发出去了。这个标记出现在捕获到的文本（stdout，失败
+# 时还有 CollectError 带出来的部分输出）里，send_greeting/run_queue 就据此
+# 分辨一次失败发生在点击之前还是之后，见 SendUncertain。
+_CLICK_MARKER = "###CLICKED###"
+
 
 def _build_send_script(job_url: str, text: str) -> str:
     """组装 browser-harness 脚本：开新标签页、点「立即沟通」、填文案、发送、
@@ -84,7 +92,14 @@ def _build_send_script(job_url: str, text: str) -> str:
     登录墙检测复用 collector.boss 的特征串（不重复维护一份），做法是在拿到
     「立即沟通」按钮之前就先打印 page_info() 和一段正文摘要——即使后面因为
     按钮找不到而 raise SystemExit，这两行也已经写进了 stdout，调用方在拿到
-    完整输出后统一跑 boss._guard_login 判断是不是登录态失效。
+    完整输出后统一跑 boss._guard_login 判断是不是登录态失效（哪怕这次
+    browser-harness 以非零退出码收场，boss.CollectError 现在也会把已经写出
+    的 stdout 带出去，见 send_greeting）。
+
+    点击发送按钮成功之后先打印 _CLICK_MARKER，再等我方消息气泡选择器
+    （wait_for_element，超时沿用 boss.POLL_TIMEOUT，和上面等聊天输入框出现
+    是同一种手法）给异步渲染留出时间，最后才读回确认——按钮被点到不等于
+    气泡已经渲染完，读回跟得太紧只会把「气泡还没出现」误判成「没发出去」。
     """
     payload = json.dumps({"url": job_url, "text": text}, ensure_ascii=False)
     lines = [
@@ -120,6 +135,9 @@ def _build_send_script(job_url: str, text: str) -> str:
         f"    sent = js({_CLICK_SEND_JS!r})",
         '    if sent != "ok":',
         '        raise SystemExit("找不到发送按钮: " + str(sent))',
+        f"    print({_CLICK_MARKER!r})",
+        f"    wait_for_element({boss.SELECTORS['chat_outgoing_bubble']!r}, "
+        f"timeout={boss.POLL_TIMEOUT})",
         f"    confirm_raw = js({_CONFIRM_SENT_JS!r})",
         "    confirm = json.loads(confirm_raw)",
         '    composer_text = (confirm.get("composer_text") or "").strip()',
@@ -138,19 +156,54 @@ def _build_send_script(job_url: str, text: str) -> str:
     return "\n".join(lines)
 
 
+class SendUncertain(RuntimeError):
+    """发送按钮已经点击，但发送后确认失败：消息很可能已经真的发出去了，
+    仅凭这一端的信息无法百分之百排除，需要人工去 Boss 对话列表核实。
+
+    区别于普通异常——run_queue 收到这个之后不会 mark_failed（那样会把配额
+    退还给一条可能已经送达的消息，也允许人工在「消息可能已发出」的情况下
+    重新批准，酿成给同一个真人重复发送），而是调用 actions.note_uncertain
+    只留一句人工核实提示，行原地留在 sending。
+    """
+
+
 def send_greeting(job_url: str, text: str) -> None:
     """真实浏览器动作：开新标签页，打开岗位详情页，点「立即沟通」，填文案，
     发送，读回确认，最后无论成功失败都关闭这个标签页。
 
     按钮用无障碍树按名字找而不是靠 CSS 类名 —— Boss 的类名比按钮文案更容易变。
-    登录墙复用 collector.boss 的 LoginRequired/_guard_login，让调用方
-    （run_queue）能把它和「这一条消息发送失败」区分开、整轮中止而不是逐行
-    耗到超时。
+
+    登录墙检测在成功和失败两条路径上都要跑，且都要先看 SENT_OK 在不在场：
+    - 成功路径（退出码 0）：`out` 就是完整 stdout。如果里面已经有 SENT_OK，
+      这条消息已经确认送达，不再跑登录墙检测就直接返回——LOGIN_MARKERS
+      里有裸词 "login"，成功发送之后的页面正文完全可能无辜地包含它，先认
+      SENT_OK 才不会把一条已经送达的消息误判成登录态失效。
+    - 失败路径（`boss.CollectError`，来自非零退出码或超时）：`run_script`
+      抛出的异常本身丢的是 stdout（brief Finding 1 之前就是这样）——现在
+      `CollectError.stdout` 把它带出来了，这里和异常消息（含 stderr 片段）
+      拼成 `combined` 再跑同一套「先认 SENT_OK 再跑登录墙检测」的逻辑。这
+      条路径修复前完全跑不到：session 过期 → 找不到「立即沟通」按钮 →
+      SystemExit → 退出码非零 → 登录墙特征串跟着 stdout 一起被丢弃。
+
+    点击发送按钮之后才失败（例如气泡还没渲染完、chat_outgoing_bubble 选择
+    器猜错、close_tab 报错、run_script 超时）和点击之前的失败（例如「立即
+    沟通」按钮本身没找到）语义完全不同——前者「消息可能已经发出」。这里靠
+    `_CLICK_MARKER` 有没有出现在捕获到的文本里分辨这两种情况，命中就抛
+    `SendUncertain` 而不是让普通异常直接被 run_queue 当成「没发出去」。
     """
-    out = boss.run_script(_build_send_script(job_url, text))
+    try:
+        out = boss.run_script(_build_send_script(job_url, text))
+    except boss.CollectError as exc:
+        combined = f"{exc.stdout}\n{exc}"
+        if "SENT_OK" not in combined:
+            boss._guard_login(combined)
+        if _CLICK_MARKER in combined:
+            raise SendUncertain(str(exc)) from exc
+        raise
+    if "SENT_OK" in out:
+        return
     boss._guard_login(out)
-    if "SENT_OK" not in out:
-        raise RuntimeError(f"发送未确认成功：{out[-500:]}")
+    raise RuntimeError(f"发送未确认成功：{out[-500:]}")
 
 
 def _record_application(
@@ -187,6 +240,21 @@ def _record_application(
     conn.commit()
 
 
+def _guarded_write(
+    report: ExecutionReport, job_id: str, write: Callable[[], None]
+) -> None:
+    """执行一次状态记账（mark_sent/mark_failed/note_uncertain），把
+    `sqlite3.OperationalError`（db.py 用的是默认 5s busy timeout，本地面板
+    并发写同一个数据库文件时会撞上「database is locked」）转成
+    `report.errors` 里的一条记录，而不是让它从这里逃出 `run_queue`——那样
+    整份 report 和队列里剩下的行会被一起丢掉，正是上一轮修复设法消除的
+    那种失败形状。"""
+    try:
+        write()
+    except sqlite3.OperationalError as exc:
+        report.errors.append(f"{job_id}: 状态写入失败（数据库繁忙）：{exc}")
+
+
 def run_queue(
     conn: sqlite3.Connection,
     *,
@@ -198,22 +266,30 @@ def run_queue(
     report = ExecutionReport()
     queue = actions.list_by_status(conn, actions.APPROVED)
 
-    for index, row in enumerate(queue):
+    # 是否已经有过一次成功认领（即将真正发送）。延迟只应该出现在两次真实
+    # 发送之间——按队列里的行号计（不管这一行会不会真的发送）会让人工每
+    # 跳过一行，执行器都白白多等一次 5-600s，见 Minor 3。
+    attempted = False
+
+    for row in queue:
         if actions.remaining_quota(conn) <= 0:
             report.quota_hit = True
             break
-        if index > 0:
-            sleep_fn(human_delay(rng))
 
         # 认领这一行：把「来源状态是否允许」折进原子 UPDATE，而不是先读一次
         # 状态再决定发不发——两次读写之间人工可能已经在面板上点了「跳过」，
         # 或者另一个执行器进程已经抢先认领了它。认领失败说明这一行此刻已经
-        # 不再可发，直接跳过、不调用 send_fn，继续处理队列里剩下的行。
+        # 不再可发，直接跳过、不调用 send_fn、不消耗一次人类延迟，继续处理
+        # 队列里剩下的行。
         try:
             actions.mark_sending(conn, row["id"])
         except actions.InvalidTransition:
             report.skipped += 1
             continue
+
+        if attempted:
+            sleep_fn(human_delay(rng))
+        attempted = True
 
         payload = json.loads(row["payload"])
         greeting = payload.get("greeting", "")
@@ -226,7 +302,13 @@ def run_queue(
             # 缺 URL 就不该打开浏览器再失败——那样真实的 send_fn 会导航到
             # 空地址，白白多等一轮超时才报错。这一行已经被认领成 sending，
             # 所以 mark_failed 从 sending 出发是合法迁移。
-            actions.mark_failed(conn, row["id"], "岗位缺少可用的 URL，未打开浏览器")
+            _guarded_write(
+                report,
+                row["job_id"],
+                lambda: actions.mark_failed(
+                    conn, row["id"], "岗位缺少可用的 URL，未打开浏览器"
+                ),
+            )
             report.failed += 1
             report.errors.append(f"{row['job_id']}: 岗位缺少可用的 URL")
             continue
@@ -241,18 +323,47 @@ def run_queue(
             # 状态机里 sending 只能走向 sent 或 failed，直接跳回 approved
             # 属于「自动恢复」，而登录墙触发的时点无法百分之百排除消息已经
             # 发出的可能——诚实地留给人工核实，而不是自动重新排队。
-            actions.mark_failed(conn, row["id"], f"登录态失效，运行已中止：{exc}")
+            _guarded_write(
+                report,
+                row["job_id"],
+                lambda: actions.mark_failed(
+                    conn, row["id"], f"登录态失效，运行已中止：{exc}"
+                ),
+            )
             report.failed += 1
             report.login_required = True
             report.errors.append(f"{row['job_id']}: 登录态失效，运行已中止")
             break
-        except Exception as exc:  # 任何失败都只留痕，不自动重试
-            actions.mark_failed(conn, row["id"], str(exc))
+        except SendUncertain as exc:
+            # 发送按钮已经点了，读回确认才失败：消息很可能已经真的发出去
+            # 了。不能 mark_failed——那会把配额还给一条可能已送达的消息，
+            # 也允许人工在「消息可能已发出」的情况下重新批准，酿成给同一
+            # 个真人重复发送。行原地留在 sending，只留一句人工核实提示。
+            _guarded_write(
+                report,
+                row["job_id"],
+                lambda: actions.note_uncertain(
+                    conn,
+                    row["id"],
+                    f"消息可能已发出，请人工到 Boss 对话列表核实后再决定：{exc}",
+                ),
+            )
+            report.uncertain += 1
+            report.errors.append(f"{row['job_id']}: 发送结果不确定，需人工核实")
+            continue
+        except Exception as exc:  # 任何失败都只留痕，不自动重试（含点击前失败）
+            _guarded_write(
+                report,
+                row["job_id"],
+                lambda: actions.mark_failed(conn, row["id"], str(exc)),
+            )
             report.failed += 1
             report.errors.append(f"{row['job_id']}: {exc}")
             continue
 
-        actions.mark_sent(conn, row["id"])
+        _guarded_write(
+            report, row["job_id"], lambda: actions.mark_sent(conn, row["id"])
+        )
         try:
             _record_application(conn, row, greeting)
         except Exception as exc:
