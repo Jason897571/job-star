@@ -2898,6 +2898,30 @@ def remaining_quota(conn: sqlite3.Connection) -> int:
 Run: `uv run pytest tests/test_actions.py -v`
 Expected: 15 passed
 
+> **实施后修正（评审发现，共两轮）**：上面 Step 3 的代码有两个真实缺陷，已在
+> `src/jobstar/actions.py` 中修正，以实际代码为准：
+>
+> 1. **check-then-act 竞态**。`_require` 先 SELECT、`UPDATE` 再单独执行，中间隔着
+>    一个事务边界（`sqlite3` 默认 `isolation_level=''`）。评审用两个连接实测复现：
+>    执行器判定通过后、人工在面板点「跳过」并提交，执行器的 `UPDATE` 仍会落地，
+>    状态变成 `sent` —— 按人最新的决定不该发的发了出去；两个执行器进程也能同时
+>    认领同一行造成重复发送。已改为把允许来源折进 `UPDATE ... WHERE status IN (...)`
+>    并校验 `rowcount`，决策与写入合为一条语句。占位符由 `_ALLOWED_FROM[target]`
+>    生成，四个写入方共用一个 `_atomic_transition` 助手。
+> 2. **每日配额跨天漏计**。`sent_at` 存 UTC（`datetime('now')`），`sent_today` 却拿
+>    `date('now','localtime')` 比。**UTC+8（杭州，实际部署地）正是最坏情况**：本地
+>    00:00–08:00 的发送，UTC 日期落在前一天，永远不计数，配额在该时段形同虚设。
+>    已改为 `date(sent_at,'localtime') = date('now','localtime')`，写入侧不变。
+>    注意这个 bug 在 UTC-4 的开发机上测不出来（那边符号相反，旧写法恰好正确）。
+>
+> 第二轮又修了第一轮引入的回归：被拒绝的迁移没有 `rollback`，会留下打开的写事务，
+> 双进程（面板 + 执行器）下第二个连接直接 `database is locked`。
+>
+> 另外按 controller 决定新增两条迁移，二者都只扩大**人工**的选择、不碰发送闸门：
+> `approved → approved`（幂等重新确认，修复面板上双击「确认」报错、以及「确认后
+> 发现文案有错要改了再确认」）、`failed → skipped`（永久失败的岗位可以放弃）。
+> `_ALLOWED_FROM[SENT]` 仍然严格是 `{approved}`。
+
 - [ ] **Step 5: 跑全套回归**
 
 Run: `uv run pytest -v`
