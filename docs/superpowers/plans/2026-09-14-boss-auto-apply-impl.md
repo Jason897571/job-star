@@ -792,11 +792,18 @@ _FENCE = re.compile(r"\A\s*```(?:json)?\s*\n(.*?)\n?\s*```\s*\Z", re.DOTALL)
 
 
 def extract_json(text: str) -> dict[str, Any]:
-    """剥掉可能存在的 markdown 围栏后解析。claude CLI 实测常带围栏。"""
+    """剥掉可能存在的 markdown 围栏后解析。claude CLI 实测常带围栏。
+
+    语法合法但形状不对（数组、标量）同样算不合 schema —— 否则下游会拿到
+    一个假装是 dict 的东西，在几层之外炸出无关的 TypeError。
+    """
     match = _FENCE.match(text)
     if match is not None:
         text = match.group(1)
-    return json.loads(text.strip())
+    parsed = json.loads(text.strip())
+    if not isinstance(parsed, dict):
+        raise ValueError(f"LLM 返回的是 {type(parsed).__name__}，不是 JSON 对象")
+    return parsed
 
 
 def _resolve_backend() -> Callable[..., str]:
@@ -824,7 +831,7 @@ def call_json(*, system: str, user: str, tier: str) -> dict[str, Any]:
         last_raw = backend(system=system, user=prompt, tier=tier)
         try:
             return extract_json(last_raw)
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:  # JSONDecodeError 是 ValueError 的子类
             last_error = exc
             prompt = user + _RETRY_HINT
     raise LLMSchemaError(
@@ -956,7 +963,14 @@ def call(*, system: str, user: str, tier: str, timeout: int = 180) -> str:
 - [ ] **Step 6: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_llm.py -v`
-Expected: 13 passed
+Expected: 12 passed
+
+> **实施后修正（评审发现）**：上面 Step 1 的测试块漏了「语法合法但形状不对」这一类。
+> `extract_json` 原版只挡 `JSONDecodeError`，模型返回一个 JSON 数组或标量时会被当成
+> dict 原样放行，绕开重试和 `LLMSchemaError`，等于架空了本任务要保证的 §7 约束。
+> 已按上面 Step 3 的最终代码修正（`isinstance(parsed, dict)` 校验 + `except ValueError`），
+> 并补了 4 个测试（数组、标量、非 dict 重试两次后抛、`_TRIM_FLAGS` 进 argv）。
+> 修正后 `tests/test_llm.py` 共 15 个用例。
 
 - [ ] **Step 7: 对真实 claude CLI 做一次冒烟（不进测试套件）**
 
