@@ -69,3 +69,13 @@ def test_set_setting_accepts_legitimate_values(conn):
     set_setting(conn, "score_threshold", None)
     set_setting(conn, "score_threshold", 70)
     set_setting(conn, "gate_rules", {"city_whitelist": ["杭州", "上海"], "salary_min": 30})
+
+
+def test_collect_health_settings_default_to_none(conn):
+    """采集健康状态（Task 13）：CLI 的 collect 子命令写入，面板顶部横幅读取。
+    在从未跑过 collect 的新库里，两项都要落到 None，而不是抛 KeyError——
+    validate_setting_value 对这两个键的校验规则已经先于本任务存在
+    （Task 12 的 CSRF/校验加固顺带补上了），这里补的是 SETTING_DEFAULTS
+    本身缺失的两个键。"""
+    assert get_setting(conn, "last_collect_error") is None
+    assert get_setting(conn, "last_collect_at") is None

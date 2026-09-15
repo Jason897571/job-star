@@ -37,6 +37,9 @@ SETTING_DEFAULTS: dict[str, Any] = {
     },
     "my_degree": "硕士",
     "my_years": 5,
+    # 采集健康状态。由 CLI 的 collect 子命令写入，面板顶部横幅读取（Task 13）。
+    "last_collect_error": None,
+    "last_collect_at": None,
 }
 
 

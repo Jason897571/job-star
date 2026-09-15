@@ -40,11 +40,36 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "collect":
+        from datetime import datetime
+
+        from jobstar.collector.boss import LoginRequired
+        from jobstar.config import set_setting
         from jobstar.pipeline import run_collect
 
-        report = run_collect(
-            conn, keyword=args.keyword, city_code=args.city, pages=args.pages
-        )
+        # 采集健康状态（Task 13）：写进 settings，供面板顶部横幅读取
+        # （/api/health）。这是被动信号——只在真的跑了一次 collect 之后才
+        # 更新，没有主动探活；last_collect_at 记的是「上一次跑 collect 的
+        # 时间」，成功失败都更新，跟 last_collect_error 是否有内容是两件事。
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            report = run_collect(
+                conn, keyword=args.keyword, city_code=args.city, pages=args.pages
+            )
+        except LoginRequired as exc:
+            # run_collect 故意让 LoginRequired 原样往外炸穿（见 pipeline.py
+            # 的注释）——登录态失效是会话级别的硬故障，不能被当成这一条采集
+            # 的失败吞掉。这里接住它、写健康状态、给出明确的下一步动作。
+            set_setting(
+                conn, "last_collect_error", f"Boss 登录态失效，采集已中止：{exc}"
+            )
+            set_setting(conn, "last_collect_at", now)
+            print(f"采集中止：{exc}", file=sys.stderr)
+            print(
+                "请在 Chrome 里重新扫码登录 Boss 直聘后再运行 collect",
+                file=sys.stderr,
+            )
+            return 2
+
         print(
             f"列表 {report.listed} 条，新增 {report.new}，"
             f"预门禁刷掉 {report.gated_out}，抓详情 {report.detail_fetched}"
@@ -56,14 +81,25 @@ def main(argv: list[str] | None = None) -> int:
             # 装作能分辨到底是哪一种，只如实告诉用户这条歧义，让人自己去
             # Boss 上核实关键词是否真的没有匹配。report.errors 在这条路径下
             # 只有这一条、且说的是同一件事，不再用下面的通用循环重复打印一遍。
-            print(
-                "  ⚠️  本次没有抓到任何列表条目——可能是关键词真的零匹配，"
-                "也可能是页面被拦截，无法自动区分，请人工核实",
-                file=sys.stderr,
+            ambiguous = (
+                "本次没有抓到任何列表条目——可能是关键词真的零匹配，"
+                "也可能是页面被拦截，无法自动区分，请人工核实"
             )
+            print(f"  ⚠️  {ambiguous}", file=sys.stderr)
+            set_setting(conn, "last_collect_error", ambiguous)
         else:
             for err in report.errors:
                 print(f"  ! {err}", file=sys.stderr)
+            if report.errors:
+                set_setting(
+                    conn,
+                    "last_collect_error",
+                    f"{len(report.errors)} 个岗位抓取失败（可能是页面结构变更）："
+                    + "；".join(report.errors[:3]),
+                )
+            else:
+                set_setting(conn, "last_collect_error", None)
+        set_setting(conn, "last_collect_at", now)
         return 0
 
     if args.cmd == "score":

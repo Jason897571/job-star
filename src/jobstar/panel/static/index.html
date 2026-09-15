@@ -53,11 +53,24 @@ let view = "queue";
 async function bar() {
   const h = await api("/api/health");
   const thr = h.score_threshold === null ? "未设（冷启动期，不生成动作）" : h.score_threshold;
-  $("#bar").innerHTML =
-    `今日已发 ${h.sent_today}/${h.daily_limit}，剩余 ${h.remaining_quota}　|　` +
-    `待确认 ${h.pending}　|　阈值 ${esc(thr)}` +
+  let html =
+    `今日已发 ${h.sent_today}/${h.daily_limit}，剩余 ${h.remaining_quota}` +
+    `（${esc(h.quota_resets_at)} 重置）　|　待确认 ${h.pending}　|　阈值 ${esc(thr)}` +
     (h.scoring_failed ? `　|　<b class="gap">打分失败 ${h.scoring_failed} 条待人工处理</b>` : "") +
     (h.uncertain ? `　|　<b class="gap">发送结果不确定 ${h.uncertain} 条，请到 Boss 对话列表人工核实</b>` : "");
+  // 采集健康状态（Task 13）：被动信号，只反映上一次真的跑过 collect 时
+  // 观察到的结果，不是主动的实时探活——所以措辞里如实带出「上次采集」
+  // 而不是暗示"现在"的状态。last_collect_error 为空时不代表零结果一定是
+  // 真实零匹配：这一层从采集器开始就无法区分"关键词零结果"和"页面被拦截"。
+  if (h.last_collect_error) {
+    html += `<br><b class="gap">⚠️ 采集异常（截至上次采集，被动信号）：${esc(h.last_collect_error)}</b> ` +
+      `<button id="clear-err">知道了</button>`;
+  } else if (h.last_collect_at) {
+    html += `<br><span class="meta">上次采集 ${esc(h.last_collect_at)}，未见异常</span>`;
+  }
+  $("#bar").innerHTML = html;
+  const btn = $("#clear-err");
+  if (btn) btn.onclick = async () => { await api("/api/health/clear-error", { method: "POST" }); bar(); };
 }
 
 async function renderQueue() {

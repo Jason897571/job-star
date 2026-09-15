@@ -472,3 +472,70 @@ def test_settings_still_accepts_legitimate_values(client):
         headers=PANEL_HEADERS,
     )
     assert resp.status_code == 200
+
+
+# --- Task 13：采集健康横幅。设计文档 §7 的错误处理表要求「面板顶部横幅
+# 提示」（登录态失效）和「面板汇总提示」（页面结构变更导致的抓取失败）。
+# collect 子命令中止或产生 errors 时，把状态写进 last_collect_error /
+# last_collect_at 这两个 setting（Task 13 在 config.py 里补的），/api/health
+# 读出来给面板顶部横幅用。
+
+
+def test_health_surfaces_collect_error(client):
+    from jobstar.config import set_setting
+
+    set_setting(client.conn, "last_collect_error", "Boss 登录态失效，采集已中止。")
+    set_setting(client.conn, "last_collect_at", "2026-09-14 10:00:00")
+    body = client.get("/api/health").json()
+    assert "登录态失效" in body["last_collect_error"]
+    assert body["last_collect_at"] == "2026-09-14 10:00:00"
+
+
+def test_health_reports_quota_reset_time(client):
+    """quota_resets_at 是下一个本地零点（配额按本地日期计数）。"""
+    body = client.get("/api/health").json()
+    assert body["quota_resets_at"].endswith("00:00:00")
+
+
+def test_health_still_reports_uncertain_count_alongside_collect_health(client):
+    """/api/health 的改动不能把 Task 12 加的 uncertain 字段挤掉——两者是
+    独立的两行面板提示（发送结果不确定 vs 采集异常），横幅要同时显示。"""
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "稿"}
+    )
+    approve(client.conn, action_id)
+    mark_sending(client.conn, action_id)
+    client.conn.execute(
+        "UPDATE actions SET error=? WHERE id=?",
+        ("消息可能已发出，请人工到 Boss 对话列表核实后再决定", action_id),
+    )
+    client.conn.commit()
+    body = client.get("/api/health").json()
+    assert body["uncertain"] == 1
+
+
+def test_clear_error_resets_banner(client):
+    """清除按钮是状态变更路由，和 approve/skip/label/settings 一样必须走
+    CSRF 依赖——面板自己的 api() 助手已经带了这个头（见 index.html）。"""
+    from jobstar.config import set_setting
+
+    set_setting(client.conn, "last_collect_error", "页面结构变更，3 个岗位解析失败")
+    resp = client.post("/api/health/clear-error", headers=PANEL_HEADERS)
+    assert resp.status_code == 200
+    assert client.get("/api/health").json()["last_collect_error"] is None
+
+
+def test_clear_error_without_panel_header_is_rejected(client):
+    from jobstar.config import set_setting
+
+    set_setting(client.conn, "last_collect_error", "页面结构变更，3 个岗位解析失败")
+    resp = client.post("/api/health/clear-error")
+    assert resp.status_code == 403
+    assert (
+        client.get("/api/health").json()["last_collect_error"]
+        == "页面结构变更，3 个岗位解析失败"
+    )
+
+
+def test_index_renders_banner_placeholder(client):
+    assert "last_collect_error" in client.get("/").text

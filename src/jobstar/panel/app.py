@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -100,15 +101,37 @@ def health(conn: sqlite3.Connection = Depends(get_db)) -> dict:
         "SELECT COUNT(*) AS n FROM actions WHERE status = ? AND error IS NOT NULL",
         (actions.SENDING,),
     ).fetchone()["n"]
+    # 下一个本地零点：配额按本地日期计数（actions.remaining_quota 同一时区
+    # 假设），这里只是把这个边界暴露给面板显示，不改变配额本身的计算方式。
+    tomorrow = (datetime.now() + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     return {
         "remaining_quota": actions.remaining_quota(conn),
         "sent_today": actions.sent_today(conn),
         "daily_limit": get_setting(conn, "daily_greeting_limit"),
+        "quota_resets_at": tomorrow.strftime("%Y-%m-%d %H:%M:%S"),
         "score_threshold": get_setting(conn, "score_threshold"),
         "scoring_failed": failed,
         "pending": len(actions.list_by_status(conn, actions.PENDING)),
         "uncertain": uncertain,
+        # 采集健康状态（Task 13）：由 CLI 的 collect 子命令写入。这是被动
+        # 信号——只反映上一次真的跑过 collect 时观察到的结果，没有主动的
+        # 活体探测（探测本身要消耗一次页面请求，对账号风控而言不划算）。
+        "last_collect_error": get_setting(conn, "last_collect_error"),
+        "last_collect_at": get_setting(conn, "last_collect_at"),
     }
+
+
+@app.post(
+    "/api/health/clear-error", dependencies=[Depends(require_panel_request)]
+)
+def clear_collect_error(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """人工点了横幅上的「知道了」。只清错误文案，不动 last_collect_at——
+    那是「上次跑 collect 的时间」的记录，跟这条错误是否已经被人工看过是
+    两件事。"""
+    set_setting(conn, "last_collect_error", None)
+    return {"ok": True}
 
 
 @app.get("/api/queue")
