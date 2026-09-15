@@ -1,6 +1,7 @@
+import time
+
 import pytest
 
-from jobstar import actions as actions_module
 from jobstar.actions import (
     APPROVED,
     FAILED,
@@ -217,43 +218,91 @@ def test_failed_can_be_given_up_on(conn):
     assert row["status"] == SKIPPED
 
 
-def test_atomic_guard_blocks_interleaved_send(conn, tmp_path, monkeypatch):
+def test_rejected_mark_sent_releases_lock_for_other_connections(conn, tmp_path):
     """Finding 1 的回归测试。
 
-    模拟最坏时序：执行者读到 approved（校验通过）之后、真正把 UPDATE 落盘
-    之前，人工在面板上点了「跳过」并提交。用 monkeypatch 把这次竞争写入精确
-    插到 `_atomic_transition` 真正执行 UPDATE 语句的前一刻——这正是旧的
-    check-then-act 实现里，SELECT 和 UPDATE 分属两个隐式事务之间唯一存在
-    的窗口。修复后 UPDATE 的 WHERE 子句会重新校验当前状态，必须失败。
+    `get_conn` 让 sqlite3 保持 isolation_level=''，UPDATE 在 WHERE 求值之前
+    就已经隐式 BEGIN。`_atomic_transition` 的 rowcount==0 分支如果不回滚就
+    直接 raise，这次什么都没改动的 UPDATE 开启的事务会一直挂在连接上，占
+    着 RESERVED 锁，卡住其他连接的所有写入——即使这次拒绝本身完全符合设
+    计（pending 不能变 sent）。拒绝是正常结果：竞态守卫按预期触发，或者人
+    工在面板上对一个已经是终态的行又点了一次确认/跳过；而架构本来就是多
+    进程的——面板进程和执行者进程都会打开这个数据库文件。
+
+    `conn.in_transaction` 是实现细节，只作为诊断信号；真正要保证的用户可
+    见行为是下面第二个连接的写入必须能完成——这一条在修复前会因为
+    `database is locked` 失败，是这里真正把关的断言。
+    """
+    action_id = _new(conn)  # 仍是 pending
+
+    with pytest.raises(InvalidTransition):
+        mark_sent(conn, action_id)
+
+    assert conn.in_transaction is False
+
+    other = get_conn(tmp_path / "t.db")
+    try:
+        other.execute("UPDATE actions SET error=? WHERE id=?", ("ping", action_id))
+        other.commit()
+    finally:
+        other.close()
+
+    row = conn.execute("SELECT error FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert row["error"] == "ping"
+
+
+def test_rejected_approve_releases_lock_for_other_connections(conn, tmp_path):
+    """Finding 1 的回归测试（覆盖另一个写入函数）。
+
+    `_atomic_transition` 的 rowcount==0 分支只有一份，四个写入函数
+    （approve/skip/mark_sent/mark_failed）共用它，但只测 mark_sent 不足以
+    防止以后有人往这个分支加新的 raise 路径却忘了回滚。这里再拿 `approve`
+    在一个已经是 sent（终态）的行上被拒绝的场景测一遍。
     """
     action_id = _new(conn)
     approve(conn, action_id)
+    mark_sent(conn, action_id)
+
+    with pytest.raises(InvalidTransition):
+        approve(conn, action_id)  # sent 是终态，approve 必须被拒绝
+
+    assert conn.in_transaction is False
+
+    other = get_conn(tmp_path / "t.db")
+    try:
+        other.execute("UPDATE actions SET error=? WHERE id=?", ("ping", action_id))
+        other.commit()
+    finally:
+        other.close()
+
+    row = conn.execute("SELECT error FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert row["error"] == "ping"
+
+
+def test_atomic_guard_blocks_interleaved_send(conn, tmp_path):
+    """Finding 1 的回归测试（不 monkeypatch 私有函数）。
+
+    两个真实连接指向同一个数据库文件：连接 A 确认（approved），连接 B 抢先
+    把状态改成 skipped 并提交，连接 A 接着调用 mark_sent——此时它对状态的
+    认知已经过时。修复后的 UPDATE 把「来源状态是否允许」折进同一条语句的
+    WHERE 子句，写入前会重新校验当前状态，必须失败，且最终状态仍是
+    skipped。
+
+    这里不再像之前那样 monkeypatch `_atomic_transition` 去精确插入竞争写
+    入：那个注入点在进入 `_atomic_transition` 之前就已经触发，效果和这里
+    直接按顺序调用 approve → skip → mark_sent 完全一样，却让测试耦合到一个
+    私有辅助函数的位置签名——一旦它被改名或内联，测试要么报错要么静默退化
+    成空操作。改写后的顺序调用测的是同一个属性（写入语句必须重新校验状
+    态），但不依赖任何私有实现细节。
+    """
+    action_id = _new(conn)
 
     conn_a = get_conn(tmp_path / "t.db")
     conn_b = get_conn(tmp_path / "t.db")
-
-    row = conn_a.execute(
-        "SELECT status FROM actions WHERE id=?", (action_id,)
-    ).fetchone()
-    assert row["status"] == APPROVED  # 执行者此刻看到的是 approved
-
-    original = actions_module._atomic_transition
-    triggered = {"done": False}
-
-    def racing_atomic_transition(conn_arg, aid, target, set_sql, set_params):
-        if (
-            conn_arg is conn_a
-            and aid == action_id
-            and target == SENT
-            and not triggered["done"]
-        ):
-            triggered["done"] = True
-            skip(conn_b, action_id)  # 人工此刻提交了「跳过」
-        return original(conn_arg, aid, target, set_sql, set_params)
-
-    monkeypatch.setattr(actions_module, "_atomic_transition", racing_atomic_transition)
-
     try:
+        approve(conn_a, action_id)
+        skip(conn_b, action_id)  # 人工抢先提交了「跳过」
+
         with pytest.raises(InvalidTransition):
             mark_sent(conn_a, action_id)
     finally:
@@ -266,45 +315,51 @@ def test_atomic_guard_blocks_interleaved_send(conn, tmp_path, monkeypatch):
     assert final["status"] == SKIPPED
 
 
-def test_sent_today_counts_previous_utc_day_current_local_day(conn):
+def test_sent_today_counts_previous_utc_day_current_local_day(conn, monkeypatch):
     """Finding 2 的回归测试。
 
     sent_at 按 UTC 落盘。如果它落在「UTC 的前一天、本地的今天」这个窗口
-    （杭州 UTC+8 的凌晨 0-8 点就是这种情况），必须被 sent_today 计入，而不是
-    永久漏计。时间戳从 SQLite 自己的 'now' 推导，不写死字面量，这样无论在
-    哪个时区跑测试都有意义（旧测试用 2020-01-01，在任何时区都恒为「不是
-    今天」，根本没测到跨天边界）。
+    （部署时区杭州 UTC+8 的凌晨 0-8 点就是这种情况：本地 01:00 存成 UTC 前
+    一天 17:00），必须被 sent_today 计入，而不是永久漏计。
+
+    测试把 TZ 固定成部署时区 Asia/Shanghai，而不是按宿主机的 UTC 偏移分支
+    判断——CI/容器宿主机默认是 UTC，偏移为 0 时旧写法会直接跳过整条测试，
+    回归永远测不到，输出变成「23 passed, 1 skipped」而不是全绿。SQLite 的
+    'localtime' 修饰符通过 libc 解析时区，所以 TZ 环境变量 + time.tzset()
+    能让它在任何宿主机上都按 UTC+8 计算，测试因此在哪里跑都确定性成立。
     """
-    row = conn.execute(
-        "SELECT strftime('%s','now') AS u, strftime('%s','now','localtime') AS l"
-    ).fetchone()
-    offset_seconds = int(row["l"]) - int(row["u"])
-    if offset_seconds == 0:
-        pytest.skip("本机 UTC 偏移为 0，无法构造跨天场景")
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+    time.tzset()
+    try:
+        # 本地零点后一小时换算成 UTC，落在 UTC 的前一天（例如本地 01:00
+        # 存成 UTC 前一天 17:00）——这正是 bug 实际咬人的那个窗口。
+        sent_at_value = conn.execute(
+            "SELECT datetime(date('now','localtime'), '+1 hours', 'utc') AS v"
+        ).fetchone()["v"]
 
-    if offset_seconds > 0:
-        # 本地时区领先 UTC（例如杭州 +8）：本地零点后一小时换算成 UTC，落在
-        # UTC 的前一天。
-        formula = "datetime(date('now','localtime'), '+1 hours', 'utc')"
-    else:
-        # 本地时区落后 UTC（例如本机 EDT -4）：本地明天零点前一小时换算成
-        # UTC，落在 UTC 的下一天——同样是「UTC 日期 ≠ 本地日期」的边界。
-        formula = "datetime(date('now','localtime','+1 day'), '-1 hours', 'utc')"
+        # 先断言边界条件本身成立，测试才不会在这个条件根本没构造出来的情况
+        # 下空洞地通过。
+        check = conn.execute(
+            "SELECT date(?) AS raw_date, date(?, 'localtime') AS local_date, "
+            "date('now','localtime') AS today",
+            (sent_at_value, sent_at_value),
+        ).fetchone()
+        assert check["raw_date"] != check["today"]
+        assert check["local_date"] == check["today"]
 
-    sent_at_value = conn.execute(f"SELECT {formula} AS v").fetchone()["v"]
+        action_id = _new(conn)
+        approve(conn, action_id)
+        mark_sent(conn, action_id)
+        conn.execute(
+            "UPDATE actions SET sent_at=? WHERE id=?", (sent_at_value, action_id)
+        )
+        conn.commit()
 
-    check = conn.execute(
-        "SELECT date(?) AS raw_date, date(?, 'localtime') AS local_date, "
-        "date('now','localtime') AS today",
-        (sent_at_value, sent_at_value),
-    ).fetchone()
-    assert check["raw_date"] != check["today"]
-    assert check["local_date"] == check["today"]
-
-    action_id = _new(conn)
-    approve(conn, action_id)
-    mark_sent(conn, action_id)
-    conn.execute("UPDATE actions SET sent_at=? WHERE id=?", (sent_at_value, action_id))
-    conn.commit()
-
-    assert sent_today(conn) == 1
+        assert sent_today(conn) == 1
+    finally:
+        # monkeypatch 在测试结束后才会把 TZ 环境变量还原，如果不在这里主动
+        # 还原 + 重新 tzset，进程级别的 C 库时区状态会在还原之前一直是
+        # Asia/Shanghai，泄漏给后面的测试。显式 undo + tzset 之后，pytest
+        # 自动触发的那次 undo 是幂等的空操作。
+        monkeypatch.undo()
+        time.tzset()

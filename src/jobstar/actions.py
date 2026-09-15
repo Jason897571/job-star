@@ -82,9 +82,21 @@ def _atomic_transition(
     cur = conn.execute(sql, (*set_params, action_id, *allowed))
     if cur.rowcount == 0:
         # 没有任何行受影响：要么动作不存在，要么当前状态不允许这次迁移。
-        # _require 重新读一次状态，只为了给出可读的报错信息。
+        # get_conn 让 sqlite3 保持 isolation_level=''，上面的 UPDATE 在
+        # WHERE 求值之前就已经隐式 BEGIN；这里不回滚就直接 raise，会让这次
+        # 什么都没改动的事务一直挂在连接上，占着 RESERVED 锁，卡住其他连接
+        # 的写入。拒绝是本模块设计要处理的正常结果（竞态守卫按预期触发、或
+        # 人工在面板上对一个已经是终态的行又点了一次），所以必须先释放锁再
+        # 抛错。用 rollback 而不是 commit：这条 UPDATE 没有改动任何行，且
+        # 本模块每个写入函数都是「一次调用即提交」，不会有调用方的工作在途
+        # 中被误回滚。
+        conn.rollback()
+        # _require 重新读一次状态（只读，不会重新开事务），只为了给出可读
+        # 的报错信息。
         _require(conn, action_id, target)
-        # 理论上不会到这里：rowcount==0 时 _require 必然抛出。
+        # 并发下另一个连接可能又把状态改回允许值：rowcount==0 时上面的
+        # UPDATE 已经确认此刻不允许，但 _require 这次重新读取发生在之后，
+        # 可能读到已经被改回允许来源状态的行，因而没有抛出，这里兜底。
         raise InvalidTransition(f"动作 {action_id} 无法变成 {target}")
     conn.commit()
 
