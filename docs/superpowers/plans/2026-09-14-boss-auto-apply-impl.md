@@ -19,7 +19,7 @@
 - **模型档位**：归一化用 `fast` 档（Sonnet / 网关的 fast 模型），打分和话术用 `strong` 档（Opus / 网关的 strong 模型）。档位名只有 `"fast"` 和 `"strong"` 两个字符串。
 - **能力卡片 YAML 用中文键**（设计文档 §4.4 规定的格式，且需要本人逐张校对），代码里映射成 ASCII 字段名；映射表只存在于 `evidence.py` 一处。
 - **所有金额单位是千元/月**（Boss 的 `20-35K` 存成 `salary_min=20, salary_max=35`）。
-- 提交信息用中文，格式 `feat: xxx` / `test: xxx` / `fix: xxx`。
+- 提交信息用中文，格式 `feat: xxx` / `test: xxx` / `fix: xxx` / `docs: xxx`（仓库既有历史已用 `docs:`）。
 
 ## File Structure
 
