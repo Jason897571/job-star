@@ -85,6 +85,39 @@ def test_load_cards_rejects_bare_string_synonyms(tmp_path):
         load_cards(p)
 
 
+def test_load_cards_rejects_unquoted_numeric_synonym(tmp_path):
+    p = tmp_path / "numeric_synonym.yaml"
+    p.write_text(
+        "- id: a\n  能力: x\n  同义表述: [429, RAG]\n  证据强度: 强\n  项目: p\n"
+        "  可量化: []\n  可讲深度: d\n  关联简历版本: []\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CardValidationError, match="同义表述"):
+        load_cards(p)
+
+
+def test_load_cards_rejects_blank_scalar_field(tmp_path):
+    p = tmp_path / "blank_project.yaml"
+    p.write_text(
+        "- id: a\n  能力: x\n  同义表述: []\n  证据强度: 强\n  项目:\n"
+        "  可量化: []\n  可讲深度: d\n  关联简历版本: []\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CardValidationError, match="项目"):
+        load_cards(p)
+
+
+def test_load_cards_allows_blank_tuple_field(tmp_path):
+    p = tmp_path / "blank_metrics.yaml"
+    p.write_text(
+        "- id: a\n  能力: x\n  同义表述: []\n  证据强度: 强\n  项目: p\n"
+        "  可量化:\n  可讲深度: d\n  关联简历版本: []\n",
+        encoding="utf-8",
+    )
+    cards = load_cards(p)
+    assert cards[0].metrics == ()
+
+
 def test_load_cards_rejects_non_list_top_level(tmp_path):
     p = tmp_path / "not_list.yaml"
     p.write_text("id: a\n能力: x\n", encoding="utf-8")
