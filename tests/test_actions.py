@@ -16,6 +16,7 @@ from jobstar.actions import (
     mark_failed,
     mark_sending,
     mark_sent,
+    note_uncertain,
     remaining_quota,
     sent_today,
     skip,
@@ -418,3 +419,27 @@ def test_sent_today_counts_previous_utc_day_current_local_day(conn, monkeypatch)
         # 自动触发的那次 undo 是幂等的空操作。
         monkeypatch.undo()
         time.tzset()
+
+
+def test_note_uncertain_writes_error_for_sending_row(conn):
+    """正常路径：调用者手里的 id 确实是自己刚 mark_sending 认领来的。"""
+    action_id = _new(conn)
+    approve(conn, action_id)
+    mark_sending(conn, action_id)
+    note_uncertain(conn, action_id, "人工核实提示")
+    row = conn.execute(
+        "SELECT status, error FROM actions WHERE id=?", (action_id,)
+    ).fetchone()
+    assert row["status"] == SENDING
+    assert row["error"] == "人工核实提示"
+
+
+def test_note_uncertain_rejects_row_not_in_sending(conn):
+    """Minor 4：note_uncertain 之前是裸 `WHERE id=?`，任何状态的行都能被
+    静默覆盖 error。传入一个不在 sending 状态的行 id（这里是 pending）
+    必须拒绝，而不是悄悄把 error 写进去。"""
+    action_id = _new(conn)  # 仍是 pending
+    with pytest.raises(InvalidTransition):
+        note_uncertain(conn, action_id, "不该写进去")
+    row = conn.execute("SELECT error FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert row["error"] is None

@@ -215,13 +215,22 @@ def note_uncertain(conn: sqlite3.Connection, action_id: int, error: str) -> None
     """记录一次「发送结果不确定」的说明，不做状态迁移——行留在 sending。
 
     区别于 mark_failed：这里不经过 `_atomic_transition`（它要求给一个目标
-    状态；这里没有目标状态，只是把 error 列换成人工核实提示），也不做 CAS
-    校验。调用者手里的这一行是它自己 `mark_sending` 认领来的：sending 不
-    在 `_ALLOWED_FROM[APPROVED]`/`_ALLOWED_FROM[SKIPPED]` 里，别的连接无法
-    把一行 sending 的动作抢去 approve/skip，此刻不存在别的写入者会跟这次
-    UPDATE 竞争。
+    状态；这里没有目标状态，只是把 error 列换成人工核实提示）。但写入仍然
+    按状态范围（Minor 4）：`WHERE id=? AND status=?`（SENDING）而不是裸
+    `WHERE id=?`——今天唯一的调用点（run_queue 里处理 `SendUncertain`）传
+    进来的 id 一定是自己刚 `mark_sending` 认领的，本来就安全；但这个写入函
+    数本身没有任何校验，未来一旦有新调用点传错一个不在 sending 的行 id，
+    会静默覆盖那一行的 error 而不报错。`rowcount == 0` 时回滚并抛
+    `InvalidTransition`，和模块里其他写入函数遇到不允许的写入时的处理方式
+    保持一致。
     """
-    conn.execute("UPDATE actions SET error=? WHERE id=?", (error, action_id))
+    cur = conn.execute(
+        "UPDATE actions SET error=? WHERE id=? AND status=?",
+        (error, action_id, SENDING),
+    )
+    if cur.rowcount == 0:
+        conn.rollback()
+        raise InvalidTransition(f"动作 {action_id} 不在 {SENDING} 状态，无法记录不确定结果")
     conn.commit()
 
 

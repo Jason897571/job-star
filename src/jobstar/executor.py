@@ -84,6 +84,16 @@ _CONFIRM_SENT_JS = (
 # 分辨一次失败发生在点击之前还是之后，见 SendUncertain。
 _CLICK_MARKER = "###CLICKED###"
 
+# Finding 3：上面这个标记是 js(_CLICK_SEND_JS) 那次 Runtime.evaluate 往返
+# 成功返回 "ok" 之后才打印的——如果往返本身失败（意外导航把执行上下文
+# 干掉、CDP 传输错误……），btn.click() 可能已经在页面里真的执行过了，但
+# Python 侧永远等不到那个 "ok"，_CLICK_MARKER 也就永远不会被打印，这次
+# 失败就会被误判成「点击之前」，退配额、允许重新批准，酿成重复发送。这个
+# 标记改在调用 js() 之前、由 Python 侧单独打印，把「即将发起点击」和「往
+# 返是否成功完成」拆成两件事——send_greeting 的点击前/点击后判断改用这
+# 个更早的标记兜底，_CLICK_MARKER 仍然保留，只作为往返确实成功的诊断信息。
+_PRE_CLICK_MARKER = "###ABOUT_TO_CLICK###"
+
 
 def _build_send_script(job_url: str, text: str) -> str:
     """组装 browser-harness 脚本：开新标签页、点「立即沟通」、填文案、发送、
@@ -96,10 +106,14 @@ def _build_send_script(job_url: str, text: str) -> str:
     browser-harness 以非零退出码收场，boss.CollectError 现在也会把已经写出
     的 stdout 带出去，见 send_greeting）。
 
-    点击发送按钮成功之后先打印 _CLICK_MARKER，再等我方消息气泡选择器
-    （wait_for_element，超时沿用 boss.POLL_TIMEOUT，和上面等聊天输入框出现
-    是同一种手法）给异步渲染留出时间，最后才读回确认——按钮被点到不等于
-    气泡已经渲染完，读回跟得太紧只会把「气泡还没出现」误判成「没发出去」。
+    点击发送按钮之前先打印 _PRE_CLICK_MARKER（Finding 3）：js(_CLICK_SEND_JS)
+    这次 Runtime.evaluate 往返本身可能失败于 btn.click() 已经执行之后，那种
+    情况下靠往返成功之后才打印的 _CLICK_MARKER 分不清点没点到，所以边界要
+    提前到「即将调用 js()」这一刻。往返成功之后再打印 _CLICK_MARKER，再等
+    我方消息气泡选择器（wait_for_element，超时沿用 boss.POLL_TIMEOUT，和上
+    面等聊天输入框出现是同一种手法）给异步渲染留出时间，最后才读回确认——
+    按钮被点到不等于气泡已经渲染完，读回跟得太紧只会把「气泡还没出现」误
+    判成「没发出去」。
     """
     payload = json.dumps({"url": job_url, "text": text}, ensure_ascii=False)
     lines = [
@@ -132,6 +146,7 @@ def _build_send_script(job_url: str, text: str) -> str:
         '    if ok != "ok":',
         '        raise SystemExit("找不到聊天输入框: " + str(ok))',
         '    cdp("Input.insertText", text=args["text"])',
+        f"    print({_PRE_CLICK_MARKER!r})",
         f"    sent = js({_CLICK_SEND_JS!r})",
         '    if sent != "ok":',
         '        raise SystemExit("找不到发送按钮: " + str(sent))',
@@ -179,26 +194,45 @@ def send_greeting(job_url: str, text: str) -> None:
       里有裸词 "login"，成功发送之后的页面正文完全可能无辜地包含它，先认
       SENT_OK 才不会把一条已经送达的消息误判成登录态失效。
     - 失败路径（`boss.CollectError`，来自非零退出码或超时）：`run_script`
-      抛出的异常本身丢的是 stdout（brief Finding 1 之前就是这样）——现在
+      抛出的异常本身丢的是 stdout（Finding 1 之前就是这样）——现在
       `CollectError.stdout` 把它带出来了，这里和异常消息（含 stderr 片段）
-      拼成 `combined` 再跑同一套「先认 SENT_OK 再跑登录墙检测」的逻辑。这
-      条路径修复前完全跑不到：session 过期 → 找不到「立即沟通」按钮 →
-      SystemExit → 退出码非零 → 登录墙特征串跟着 stdout 一起被丢弃。
+      拼成 `combined`。这条路径修复前完全跑不到：session 过期 → 找不到
+      「立即沟通」按钮 → SystemExit → 退出码非零 → 登录墙特征串跟着
+      stdout 一起被丢弃。
+
+    这条失败路径上的判断顺序是刻意的，不是随手写的先后：
+    1. 先认 SENT_OK——`_build_send_script` 的 finally 块在 SENT_OK 打印之后
+       才执行 `close_tab()`，如果那一步报错，进程会以非零退出码收场，但消
+       息已经确认送达。这不是失败也不是不确定，直接当成功返回（Finding 2），
+       不能让纯粹的收尾噪音把一条已经送达的消息打成人工核实提示。
+    2. 再看点击标记（`_PRE_CLICK_MARKER` 或 `_CLICK_MARKER`）在不在场，命中
+       就抛 `SendUncertain`，**不再**往下跑登录墙检测（Finding 1）。原因：
+       能走到「即将点击」这一步，前面已经先后扛过了「立即沟通」按钮查找、
+       聊天输入框等待两轮失败点——真正的登录态失效会在那两步之一就
+       `SystemExit`，走不到点击这里。`LOGIN_MARKERS` 里的裸词 "login" 完全
+       可能无辜地出现在 `_build_send_script` 一开始就打印的 ###BODY### 页面
+       正文摘要里（这段摘要在找「立即沟通」按钮之前就已经写进 stdout，点击
+       前点击后的失败都带着它），如果登录墙检测跑在点击标记检测之前，会把
+       「点击之后才失败、消息可能已经发出」误判成「登录态失效」——那样会
+       mark_failed 退配额、允许人工重新批准，酿成给同一个真人重复发送。
+       **不要把这个顺序「修」回登录墙检测在前**——那正是本轮要修的洞。
+    3. 走到这里说明点击从未发起，才是登录墙检测该管的范围，跑
+       `boss._guard_login` 再把原始异常抛出去。
 
     点击发送按钮之后才失败（例如气泡还没渲染完、chat_outgoing_bubble 选择
-    器猜错、close_tab 报错、run_script 超时）和点击之前的失败（例如「立即
-    沟通」按钮本身没找到）语义完全不同——前者「消息可能已经发出」。这里靠
-    `_CLICK_MARKER` 有没有出现在捕获到的文本里分辨这两种情况，命中就抛
-    `SendUncertain` 而不是让普通异常直接被 run_queue 当成「没发出去」。
+    器猜错、close_tab 报错、run_script 超时、往返本身失败于点击已经发起之
+    后）和点击之前的失败（例如「立即沟通」按钮本身没找到）语义完全不同——
+    前者「消息可能已经发出」。
     """
     try:
         out = boss.run_script(_build_send_script(job_url, text))
     except boss.CollectError as exc:
         combined = f"{exc.stdout}\n{exc}"
-        if "SENT_OK" not in combined:
-            boss._guard_login(combined)
-        if _CLICK_MARKER in combined:
+        if "SENT_OK" in combined:
+            return
+        if _PRE_CLICK_MARKER in combined or _CLICK_MARKER in combined:
             raise SendUncertain(str(exc)) from exc
+        boss._guard_login(combined)
         raise
     if "SENT_OK" in out:
         return
@@ -266,9 +300,12 @@ def run_queue(
     report = ExecutionReport()
     queue = actions.list_by_status(conn, actions.APPROVED)
 
-    # 是否已经有过一次成功认领（即将真正发送）。延迟只应该出现在两次真实
-    # 发送之间——按队列里的行号计（不管这一行会不会真的发送）会让人工每
-    # 跳过一行，执行器都白白多等一次 5-600s，见 Minor 3。
+    # 是否已经有过一行真正调用过 send_fn。延迟只应该出现在两次真实发送
+    # 之间——按队列里的行号计（不管这一行会不会真的发送）会让人工每跳过
+    # 一行，执行器都白白多等一次 5-600s，见 Minor 3。只在确定要调用
+    # send_fn 之前才置 True（认领成功但缺 URL、从未打开浏览器的行不算，
+    # 见 Minor 5），否则这种行会替下一行——很可能是第一次真正发送——
+    # 白白占用一次本不该有的延迟。
     attempted = False
 
     for row in queue:
@@ -287,10 +324,6 @@ def run_queue(
             report.skipped += 1
             continue
 
-        if attempted:
-            sleep_fn(human_delay(rng))
-        attempted = True
-
         payload = json.loads(row["payload"])
         greeting = payload.get("greeting", "")
         job = conn.execute(
@@ -301,7 +334,10 @@ def run_queue(
         if not url:
             # 缺 URL 就不该打开浏览器再失败——那样真实的 send_fn 会导航到
             # 空地址，白白多等一轮超时才报错。这一行已经被认领成 sending，
-            # 所以 mark_failed 从 sending 出发是合法迁移。
+            # 所以 mark_failed 从 sending 出发是合法迁移。这一步刻意排在
+            # attempted 判断之前：这一行从未真正调用 send_fn，不该占用
+            # 「下两次真实发送之间才需要延迟」的名额，否则下一行即使是第一
+            # 次真正发送，也会被迫先睡一次 5-600s（Minor 5）。
             _guarded_write(
                 report,
                 row["job_id"],
@@ -312,6 +348,10 @@ def run_queue(
             report.failed += 1
             report.errors.append(f"{row['job_id']}: 岗位缺少可用的 URL")
             continue
+
+        if attempted:
+            sleep_fn(human_delay(rng))
+        attempted = True
 
         try:
             send_fn(url, greeting)

@@ -12,6 +12,8 @@ from jobstar.config import set_setting
 from jobstar.db import get_conn, init_db
 from jobstar.executor import (
     ExecutionReport,
+    _CLICK_MARKER,
+    _PRE_CLICK_MARKER,
     _build_send_script,
     human_delay,
     run_queue,
@@ -588,3 +590,181 @@ def test_operational_error_from_bookkeeping_is_recorded_and_loop_continues(
     assert any("locked" in e for e in report.errors)
     rows = conn.execute("SELECT status FROM actions").fetchall()
     assert {r["status"] for r in rows} == {SENDING}, "记账没写进去，行原地留在 sending"
+
+
+# --- Fix round 3 -----------------------------------------------------------
+
+
+def test_post_click_failure_with_login_word_in_body_dump_is_not_login_wall(
+    conn, monkeypatch
+):
+    """Finding 1（CRITICAL）：`_build_send_script` 在拿到「立即沟通」按钮之
+    前就把 ###BODY### 页面正文摘要写进了 stdout，点击前/点击后的失败都带
+    着它。`boss.LOGIN_MARKERS` 里有裸词 "login"，真实页面正文完全可能无辜
+    地包含它。这次失败发生在点击**之后**（气泡渲染慢/选择器猜错等，脚本以
+    非零退出码收场，且从未打印 SENT_OK）——修复前的判断顺序是先跑
+    `boss._guard_login(combined)` 再看点击标记，命中 "login" 就会被误判成
+    登录态失效：`run_queue` 走 `LoginRequired` 分支 `mark_failed`，退配额、
+    把行变回 `approved` 允许人工重新批准，而消息其实可能已经真的发出去
+    了——人工据此重新批准就会给同一个真人发出重复的打招呼消息。
+
+    这条测试要证明修复后的行为：不是 `LoginRequired`/`failed`，行落在
+    `sending`，`error` 是人工核实提示而不是「登录态失效」，配额仍被这一行
+    占用，且这一行不可再被 `approve()`。对着修复前的代码跑，本测试的
+    `report.login_required is False`/`report.failed == 0` 两个断言会失败。
+    """
+    aid = _approved(conn, "j1")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/browser-harness")
+
+    stdout_after_click_with_login_word = (
+        "###PAGEINFO###{'url': 'https://www.zhipin.com/job_detail/j1~.html'}\n"
+        "###BODY###完善简历，全网 login 更快找到工作\n"
+        f"{_PRE_CLICK_MARKER}\n"
+        f"{_CLICK_MARKER}\n"
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout=stdout_after_click_with_login_word,
+            stderr="SystemExit: 发送后最新消息未包含文案前缀，怀疑发送失败",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    report = run_queue(conn, send_fn=send_greeting, sleep_fn=lambda _: None)
+
+    assert report.login_required is False
+    assert report.failed == 0
+    assert report.uncertain == 1
+    row = conn.execute("SELECT status, error FROM actions WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == SENDING
+    assert "请人工到 Boss 对话列表核实" in row["error"]
+    assert "登录" not in row["error"]
+
+    assert actions.sent_today(conn) == 1, "配额仍然被这一行占用"
+    with pytest.raises(actions.InvalidTransition):
+        approve(conn, aid)  # sending 不允许被 approve 当来源状态，不可再批准
+
+
+def test_genuine_login_wall_before_any_click_still_aborts_run(conn, monkeypatch):
+    """Finding 1 的再确认：把点击标记检查提到登录墙检测前面之后，真正的登
+    录墙（点击之前就失败，从未点到「立即沟通」之后的任何一步）必须继续被
+    识别，run_queue 必须中止，剩下的行不再被尝试。"""
+    _approved(conn, "aaa")
+    id_b = _approved(conn, "bbb")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/browser-harness")
+
+    login_page_dump = (
+        "###PAGEINFO###{'url': 'https://www.zhipin.com/web/user/?ka=header-login'}\n"
+        "###BODY###请先登录后继续操作\n"
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout=login_page_dump,
+            stderr='SystemExit: 找不到「立即沟通」按钮',
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    report = run_queue(conn, send_fn=send_greeting, sleep_fn=lambda _: None)
+
+    assert report.login_required is True
+    row_b = conn.execute("SELECT status FROM actions WHERE id=?", (id_b,)).fetchone()
+    assert row_b["status"] == APPROVED, "登录墙触发之后，bbb 从未被尝试"
+
+
+def test_confirmed_send_with_teardown_error_is_sent_not_uncertain(conn, monkeypatch):
+    """Finding 2：`close_tab()` 在 finally 块里于 SENT_OK 打印之后才报错，
+    进程因此以非零退出码收场，但消息已经确认送达。这种纯粹的收尾噪音不该
+    把这一行误判成 uncertain（此前会落入 `_CLICK_MARKER` 分支，把一条已经
+    确认送达的消息变成人工核实噪音）。"""
+    aid = _approved(conn, "j1")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/browser-harness")
+
+    stdout_confirmed_then_teardown_error = (
+        f"###PAGEINFO###{{}}\n{_PRE_CLICK_MARKER}\n{_CLICK_MARKER}\nSENT_OK\n"
+    )
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout=stdout_confirmed_then_teardown_error,
+            stderr="RuntimeError: close_tab 失败：target closed",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    report = run_queue(conn, send_fn=send_greeting, sleep_fn=lambda _: None)
+
+    assert report.sent == 1
+    assert report.uncertain == 0
+    assert report.failed == 0
+    row = conn.execute("SELECT status FROM actions WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == SENT
+
+
+def test_failure_after_about_to_click_marker_with_no_completion_marker_is_uncertain(
+    conn, monkeypatch
+):
+    """Finding 3：js(_CLICK_SEND_JS) 那次 Runtime.evaluate 往返本身失败
+    （意外导航把执行上下文干掉、CDP 传输错误……），`btn.click()` 可能已经
+    在页面里真的执行过了，但往返永远拿不到 "ok"，往返成功之后才打印的
+    `_CLICK_MARKER` 因此永远不会出现。分类边界必须是调用 js() 之前、由
+    Python 侧打印的 `_PRE_CLICK_MARKER`，而不是 `_CLICK_MARKER`——否则这次
+    失败会被误判成「点击之前」，退配额、允许重新批准。"""
+    aid = _approved(conn, "j1")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/browser-harness")
+
+    stdout_about_to_click_only = f"###PAGEINFO###{{}}\n{_PRE_CLICK_MARKER}\n"
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout=stdout_about_to_click_only,
+            stderr="RuntimeError: execution context was destroyed",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    report = run_queue(conn, send_fn=send_greeting, sleep_fn=lambda _: None)
+
+    assert report.uncertain == 1
+    assert report.failed == 0
+    row = conn.execute("SELECT status FROM actions WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == SENDING
+
+
+def test_no_url_row_does_not_consume_first_send_delay_exemption(conn):
+    """Minor 5：认领成功但缺 URL 的行从未真正调用 send_fn（`attempted` 修复
+    前会在这种行上也被置 True），不该占用「下一次真实发送前需要延迟」的名
+    额——否则队列里的下一行，即使是第一次真正发送，也会被迫先睡一次
+    5-600s，违反「第一次真实发送之前没有延迟」这条性质。"""
+    conn.execute(
+        "INSERT INTO jobs (platform, job_id, title, company, raw_jd) "
+        "VALUES ('boss', 'nourl', 't', 'c', 'jd')"
+    )
+    conn.commit()
+    aid_nourl = enqueue(
+        conn, type="send_greeting", job_id="nourl", payload={"greeting": "你好"}
+    )
+    approve(conn, aid_nourl)
+    _approved(conn, "hasurl")  # 排在 nourl 之后，是队列里第一个真正发送的行
+
+    delays = []
+    sent = []
+    report = run_queue(
+        conn,
+        send_fn=lambda u, t: sent.append(u),
+        sleep_fn=delays.append,
+    )
+
+    assert report.failed == 1, "nourl 行失败但从未调用 send_fn"
+    assert len(sent) == 1
+    assert delays == [], "唯一一次真正发送之前不该有延迟"
