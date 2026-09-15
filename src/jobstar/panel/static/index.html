@@ -1,0 +1,197 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>jobstar 面板</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.6 -apple-system, "PingFang SC", sans-serif; margin: 0; padding: 20px; max-width: 900px; }
+  nav button { padding: 6px 14px; margin-right: 6px; cursor: pointer; }
+  nav button.on { font-weight: 700; }
+  .bar { padding: 8px 12px; border-radius: 6px; background: #f2f2f2; margin-bottom: 16px; font-size: 13px; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+  .card.uncertain { border-color: #b35; background: #fff6f6; }
+  .meta { color: #666; font-size: 13px; }
+  .score { float: right; font-size: 22px; font-weight: 700; }
+  textarea { width: 100%; min-height: 110px; font: inherit; padding: 8px; box-sizing: border-box; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  .gap { color: #b35; }
+  .jd { white-space: pre-wrap; max-height: 320px; overflow: auto; background: #fafafa; padding: 10px; border-radius: 6px; }
+  label { display: block; margin: 8px 0; }
+  label input { width: 320px; }
+  h3 { margin: 0 0 10px; }
+  @media (prefers-color-scheme: dark) {
+    .bar, .jd { background: #222; }
+    .card { border-color: #444; }
+    .card.uncertain { background: #2a1414; border-color: #c66; }
+  }
+</style>
+
+<nav>
+  <button data-view="queue" class="on">待确认队列</button>
+  <button data-view="label">标注</button>
+  <button data-view="threshold">阈值</button>
+  <button data-view="settings">设置</button>
+</nav>
+<div class="bar" id="bar"></div>
+<div id="main"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const api = (p, o) => fetch(p, o).then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)));
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+// url 来自采集器抓取的 <a href>（见 collector/boss.py），不是本系统自己
+// 生成的值——esc() 只挡得住 HTML 转义，挡不住 javascript: 这类协议。这里
+// 只放行 http(s) 链接，否则渲染成 "#"，防止一个被抓到的恶意 href 在人工
+// 点「原页面」时于面板的源上执行脚本。
+const safeHref = (u) => /^https?:\/\//i.test(u || "") ? esc(u) : "#";
+let view = "queue";
+
+async function bar() {
+  const h = await api("/api/health");
+  const thr = h.score_threshold === null ? "未设（冷启动期，不生成动作）" : h.score_threshold;
+  $("#bar").innerHTML =
+    `今日已发 ${h.sent_today}/${h.daily_limit}，剩余 ${h.remaining_quota}　|　` +
+    `待确认 ${h.pending}　|　阈值 ${esc(thr)}` +
+    (h.scoring_failed ? `　|　<b class="gap">打分失败 ${h.scoring_failed} 条待人工处理</b>` : "") +
+    (h.uncertain ? `　|　<b class="gap">发送结果不确定 ${h.uncertain} 条，请到 Boss 对话列表人工核实</b>` : "");
+}
+
+async function renderQueue() {
+  const { items, uncertain } = await api("/api/queue");
+  let html = "";
+  if (uncertain.length) {
+    html += `<h3>发送结果不确定 —— 请人工到 Boss 对话列表核实</h3>` + uncertain.map(u => `
+      <div class="card uncertain">
+        <b>${esc(u.title)}</b> · ${esc(u.company)}
+        <div class="meta"><a href="${safeHref(u.url)}" target="_blank">原页面</a></div>
+        <div class="gap">${esc(u.error)}</div>
+      </div>`).join("");
+  }
+  if (!items.length) {
+    html += "<p>队列为空。</p>";
+  } else {
+    html += items.map(i => `
+      <div class="card" data-id="${i.action_id}">
+        <span class="score">${i.total ?? "-"}</span>
+        <b>${esc(i.title)}</b> · ${esc(i.company)}
+        <div class="meta">${esc(i.city)} · ${esc(i.salary_raw)} ·
+          <a href="${safeHref(i.url)}" target="_blank">原页面</a> ·
+          <a href="#" data-detail="${esc(i.job_id)}">分数拆解</a></div>
+        <textarea>${esc(i.greeting)}</textarea>
+        <div class="row">
+          <button data-act="approve">确认发送</button>
+          <button data-act="skip">跳过</button>
+        </div>
+        <div class="detail"></div>
+      </div>`).join("");
+  }
+  $("#main").innerHTML = html;
+}
+
+async function renderLabel() {
+  const j = await api("/api/label/next");
+  if (!j.job_id) { $("#main").innerHTML = "<p>没有待标注的岗位了。</p>"; return; }
+  $("#main").innerHTML = `
+    <div class="card" data-label="${esc(j.job_id)}">
+      <span class="score">${j.total}</span>
+      <b>${esc(j.title)}</b> · ${esc(j.company)}
+      <div class="meta">${esc(j.city)} · ${esc(j.salary_raw)}</div>
+      <div class="jd">${esc(j.raw_jd)}</div>
+      <div class="row">
+        <button data-label-yes>会投 (y)</button>
+        <button data-label-no>不会投 (n)</button>
+      </div>
+      <div class="meta">键盘 y / n 可以快速翻页</div>
+    </div>`;
+}
+
+async function renderThreshold() {
+  const t = await api("/api/threshold");
+  const f = (g) => g.count ? `${g.count} 条，区间 ${g.min} – ${g.max}，均值 ${g.mean}` : "无";
+  $("#main").innerHTML = `
+    <div class="card">
+      <p>已标注 <b>${t.labeled_total}</b> 条（设计文档建议 30-50 条后再定阈值）。</p>
+      <p>会投：${f(t.would_apply)}</p>
+      <p>不会投：${f(t.would_not_apply)}</p>
+      <p class="meta">会投组的下界和不会投组的上界之间，就是阈值的候选区间。
+        若两组大量重叠，说明某个维度权重不对，先去设置里调权重再重跑打分。</p>
+      <p class="meta">会投分数：${t.scores_yes.join(", ") || "无"}</p>
+      <p class="meta">不会投分数：${t.scores_no.join(", ") || "无"}</p>
+    </div>`;
+}
+
+async function renderSettings() {
+  const s = await api("/api/settings");
+  $("#main").innerHTML = `<div class="card">` + Object.entries(s).map(([k, v]) =>
+    `<label>${esc(k)}<br><input data-key="${esc(k)}" value='${esc(JSON.stringify(v))}'></label>`
+  ).join("") + `<button id="save">保存</button>
+    <div class="meta">值按 JSON 解析。score_threshold 填 null 表示冷启动期不生成动作。</div></div>`;
+  $("#save").onclick = async () => {
+    const body = {};
+    for (const el of document.querySelectorAll("[data-key]")) {
+      try { body[el.dataset.key] = JSON.parse(el.value); }
+      catch { alert(`${el.dataset.key} 不是合法 JSON`); return; }
+    }
+    await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    await bar(); alert("已保存");
+  };
+}
+
+const VIEWS = { queue: renderQueue, label: renderLabel, threshold: renderThreshold, settings: renderSettings };
+async function render() { await bar(); await VIEWS[view](); }
+
+document.addEventListener("click", async (e) => {
+  const navBtn = e.target.closest("nav button");
+  if (navBtn) {
+    document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b === navBtn));
+    view = navBtn.dataset.view; return render();
+  }
+  const act = e.target.dataset.act;
+  if (act) {
+    const card = e.target.closest(".card");
+    const id = card.dataset.id;
+    const greeting = card.querySelector("textarea").value;
+    try {
+      await api(`/api/actions/${id}/${act}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(act === "approve" ? { greeting } : {}),
+      });
+    } catch (err) { alert(err.detail || "操作失败"); }
+    return render();
+  }
+  const detail = e.target.dataset.detail;
+  if (detail) {
+    e.preventDefault();
+    const box = e.target.closest(".card").querySelector(".detail");
+    const d = await api(`/api/jobs/${detail}`);
+    box.innerHTML = d.dimensions.map(dim => `
+      <div style="margin-top:10px">
+        <b>${esc(dim.label)}: ${dim.score}</b><br>
+        <span class="meta">${esc(dim.reason)}</span><br>
+        ${dim.cards.map(c => `<span class="meta">[${esc(c.id)}] ${esc(c.capability)}（证据${esc(c.strength)}）· ${esc(c.project)}</span><br>`).join("")}
+        <span class="gap">缺口：${esc(dim.gap)}</span>
+      </div>`).join("");
+    return;
+  }
+  const yes = e.target.hasAttribute("data-label-yes");
+  const no = e.target.hasAttribute("data-label-no");
+  if (yes || no) return label(yes);
+});
+
+async function label(wouldApply) {
+  const card = document.querySelector("[data-label]");
+  if (!card) return;
+  await api("/api/label", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_id: card.dataset.label, would_apply: wouldApply }),
+  });
+  render();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (view !== "label" || e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
+  if (e.key === "y") label(true);
+  if (e.key === "n") label(false);
+});
+
+render();
+</script>

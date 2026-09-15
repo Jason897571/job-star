@@ -95,10 +95,19 @@ CREATE INDEX IF NOT EXISTS idx_actions_status ON actions (status);
 
 
 def get_conn(path: Path | None = None) -> sqlite3.Connection:
-    """打开数据库连接。行以 sqlite3.Row 返回，支持按列名取值。"""
+    """打开数据库连接。行以 sqlite3.Row 返回，支持按列名取值。
+
+    `check_same_thread=False`：Web 面板（Task 12）的同步路由函数由
+    FastAPI/Starlette 派发到 anyio 的工作线程池执行，同一个连接对象可能
+    先在一个线程里创建、再在另一个线程里被路由函数使用——sqlite3 默认的
+    同线程检查会把这种情况直接判成错误。这里没有真正的多线程并发访问
+    同一个连接（这套系统里同一个连接对象在任意时刻只被一个调用方使用），
+    只是「创建」和「使用」这两步不保证发生在同一个线程，关掉这项检查是
+    安全的。CLI/执行器仍然是单线程使用，不受影响。
+    """
     db_path = Path(path) if path is not None else DEFAULT_DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
