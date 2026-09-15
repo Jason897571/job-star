@@ -50,6 +50,59 @@ def test_load_cards_rejects_missing_required_key(tmp_path):
         load_cards(p)
 
 
+def test_load_cards_rejects_none_list_item(tmp_path):
+    p = tmp_path / "none_item.yaml"
+    p.write_text(
+        "- id: a\n  能力: x\n  同义表述: []\n  证据强度: 强\n  项目: p\n"
+        "  可量化: []\n  可讲深度: d\n  关联简历版本: []\n"
+        "-\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CardValidationError, match="不是合法的映射结构"):
+        load_cards(p)
+
+
+def test_load_cards_rejects_scalar_list_item(tmp_path):
+    p = tmp_path / "scalar_item.yaml"
+    p.write_text(
+        "- id: a\n  能力: x\n  同义表述: []\n  证据强度: 强\n  项目: p\n"
+        "  可量化: []\n  可讲深度: d\n  关联简历版本: []\n"
+        "- 123\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CardValidationError, match="不是合法的映射结构"):
+        load_cards(p)
+
+
+def test_load_cards_rejects_bare_string_synonyms(tmp_path):
+    p = tmp_path / "bare_synonyms.yaml"
+    p.write_text(
+        "- id: a\n  能力: x\n  同义表述: 检索增强\n  证据强度: 强\n  项目: p\n"
+        "  可量化: []\n  可讲深度: d\n  关联简历版本: []\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(CardValidationError, match="同义表述"):
+        load_cards(p)
+
+
+def test_load_cards_rejects_non_list_top_level(tmp_path):
+    p = tmp_path / "not_list.yaml"
+    p.write_text("id: a\n能力: x\n", encoding="utf-8")
+    with pytest.raises(CardValidationError, match="顶层必须是列表"):
+        load_cards(p)
+
+
+def test_load_cards_strips_padded_capability(tmp_path):
+    p = tmp_path / "padded.yaml"
+    p.write_text(
+        "- id: a\n  能力: '  带空格的能力  '\n  同义表述: []\n  证据强度: 强\n"
+        "  项目: p\n  可量化: []\n  可讲深度: d\n  关联简历版本: []\n",
+        encoding="utf-8",
+    )
+    cards = load_cards(p)
+    assert cards[0].capability == "带空格的能力"
+
+
 def test_full_dump_store_ignores_jd_and_returns_all():
     cards = load_cards(FIXTURES / "cards_ok.yaml")
     store = FullDumpStore(cards)

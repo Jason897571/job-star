@@ -33,6 +33,10 @@ class CardValidationError(ValueError):
 
 
 def _build_card(raw: dict[str, Any], index: int) -> CapabilityCard:
+    if not isinstance(raw, dict):
+        raise CardValidationError(
+            f"第 {index + 1} 张卡片不是合法的映射结构，实际是 {type(raw).__name__}"
+        )
     missing = [k for k in _KEY_MAP if k not in raw]
     if missing:
         raise CardValidationError(f"第 {index + 1} 张卡片缺少字段：{missing}")
@@ -40,6 +44,10 @@ def _build_card(raw: dict[str, Any], index: int) -> CapabilityCard:
     for cn_key, field in _KEY_MAP.items():
         value = raw[cn_key]
         if field in _TUPLE_FIELDS:
+            if value is not None and not isinstance(value, list):
+                raise CardValidationError(
+                    f"第 {index + 1} 张卡片的「{cn_key}」必须是列表，实际写的是 {value!r}"
+                )
             fields[field] = tuple(value or ())
         elif field == "strength":
             try:
@@ -50,7 +58,7 @@ def _build_card(raw: dict[str, Any], index: int) -> CapabilityCard:
                     f"第 {index + 1} 张卡片的证据强度是 {value!r}，只能是 {allowed}"
                 ) from exc
         else:
-            fields[field] = str(value)
+            fields[field] = str(value).strip()
     return CapabilityCard(**fields)
 
 
