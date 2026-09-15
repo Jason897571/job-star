@@ -1,0 +1,27 @@
+[project]
+name = "jobstar"
+version = "0.1.0"
+description = "Boss 直聘岗位匹配与沟通助手"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+jobstar = "jobstar.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jobstar"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
