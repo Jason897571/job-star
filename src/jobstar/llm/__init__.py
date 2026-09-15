@@ -33,7 +33,10 @@ def extract_json(text: str) -> dict[str, Any]:
     match = _FENCE.match(text)
     if match is not None:
         text = match.group(1)
-    return json.loads(text.strip())
+    parsed = json.loads(text.strip())
+    if not isinstance(parsed, dict):
+        raise ValueError(f"LLM 返回的是 {type(parsed).__name__}，不是 JSON 对象")
+    return parsed
 
 
 def _resolve_backend() -> Callable[..., str]:
@@ -61,7 +64,7 @@ def call_json(*, system: str, user: str, tier: str) -> dict[str, Any]:
         last_raw = backend(system=system, user=prompt, tier=tier)
         try:
             return extract_json(last_raw)
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:
             last_error = exc
             prompt = user + _RETRY_HINT
     raise LLMSchemaError(

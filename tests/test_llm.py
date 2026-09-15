@@ -23,9 +23,19 @@ def test_extract_json_tolerates_surrounding_whitespace():
     assert extract_json('\n\n  {"a": 1}  \n') == {"a": 1}
 
 
-def test_extract_json_rejects_non_object():
+def test_extract_json_rejects_malformed_text():
     with pytest.raises(json.JSONDecodeError):
         extract_json("这不是 JSON")
+
+
+def test_extract_json_rejects_json_array():
+    with pytest.raises(ValueError):
+        extract_json("[1, 2, 3]")
+
+
+def test_extract_json_rejects_json_scalar():
+    with pytest.raises(ValueError):
+        extract_json('"just a string"')
 
 
 def test_call_json_retries_once_then_raises(monkeypatch):
@@ -39,6 +49,20 @@ def test_call_json_retries_once_then_raises(monkeypatch):
     with pytest.raises(LLMSchemaError):
         call_json(system="s", user="u", tier="fast")
     assert len(calls) == 2, "设计文档 §7：重试一次，不是无限重试"
+    assert "JSON" in calls[1], "第二次应当把「上次不是合法 JSON」的提示追加进去"
+
+
+def test_call_json_retries_once_on_non_dict_then_raises(monkeypatch):
+    calls = []
+
+    def fake_call(*, system, user, tier, timeout=180):
+        calls.append(user)
+        return "[1, 2, 3]"
+
+    monkeypatch.setattr("jobstar.llm._resolve_backend", lambda: fake_call)
+    with pytest.raises(LLMSchemaError):
+        call_json(system="s", user="u", tier="fast")
+    assert len(calls) == 2, "非 dict 的合法 JSON 也应重试一次，而不是直接崩溃"
     assert "JSON" in calls[1], "第二次应当把「上次不是合法 JSON」的提示追加进去"
 
 
@@ -81,6 +105,8 @@ def test_claude_cli_unwraps_envelope(monkeypatch):
     assert captured["input"] == "用户内容", "prompt 必须走 stdin，不走 argv"
     assert "--model" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--model") + 1] == "opus"
+    for flag in mod._TRIM_FLAGS:
+        assert flag in captured["cmd"], f"缺少剥离上下文的参数：{flag!r}"
 
 
 def test_claude_cli_raises_on_error_envelope(monkeypatch):
