@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from jobstar import actions
-from jobstar.collector.boss import run_script
+from jobstar.collector import boss
 
 # 对数正态参数：中位数 e^3.6 ≈ 36 秒，长尾能拉到几分钟
 _DELAY_MU = 3.6
@@ -28,7 +28,9 @@ _DELAY_MAX = 600.0
 class ExecutionReport:
     sent: int = 0
     failed: int = 0
+    skipped: int = 0
     quota_hit: bool = False
+    login_required: bool = False
     errors: list[str] = field(default_factory=list)
 
 
@@ -38,60 +40,115 @@ def human_delay(rng: random.Random) -> float:
     return max(_DELAY_MIN, min(_DELAY_MAX, value))
 
 
-# 聊天框与发送按钮的选择器。与 collector.boss.SELECTORS 同源，页面改版时一起改。
+# 聊天框/发送按钮/我方消息气泡的选择器：直接读 collector.boss.SELECTORS，
+# 与列表页/详情页选择器同源，页面改版时在同一个字典里一起改（不再各自维护
+# 一份），并标了 UNVERIFIED——校准状态见 boss.py 顶部注释。
 # 单独提成常量是为了避免在 f-string 里嵌套三引号 —— 那会提前终止外层字符串。
 _FOCUS_INPUT_JS = (
     "const box = document.querySelector("
-    "'#chat-input, textarea.input-area, div[contenteditable=true]');"
+    f"{boss.SELECTORS['chat_input']!r});"
     "if (!box) return 'no-input';"
     "box.focus();"
     "return 'ok';"
 )
 
 _CLICK_SEND_JS = (
-    "const btn = document.querySelector('.btn-send, button[type=submit]');"
+    "const btn = document.querySelector("
+    f"{boss.SELECTORS['chat_send']!r});"
     "if (!btn) return 'no-send-button';"
     "btn.click();"
     "return 'ok';"
 )
 
+# 发送后的读回校验：按钮被点到了不代表消息真的发出去了（Input.insertText
+# 打在了没聚焦的元素上，或聊天框还没挂载完，按钮依旧存在、依旧能点）。读
+# 回聊天框是否已清空、最新一条我方气泡是否包含刚才发的文案，交给 Python
+# 侧比较（JS 只负责取值），比较逻辑才能在不开浏览器的情况下被测试覆盖。
+_CONFIRM_SENT_JS = (
+    "const box = document.querySelector("
+    f"{boss.SELECTORS['chat_input']!r});"
+    "const bubbles = document.querySelectorAll("
+    f"{boss.SELECTORS['chat_outgoing_bubble']!r});"
+    "const last = bubbles.length ? bubbles[bubbles.length - 1] : null;"
+    "return JSON.stringify({"
+    "composer_text: box ? (box.value !== undefined ? box.value : box.innerText) : null,"
+    "last_bubble_text: last ? last.innerText : null"
+    "});"
+)
 
-def send_greeting(job_url: str, text: str) -> None:
-    """真实浏览器动作：打开岗位详情页，点「立即沟通」，填文案，发送。
 
-    按钮用无障碍树按名字找而不是靠 CSS 类名 —— Boss 的类名比按钮文案更容易变。
+def _build_send_script(job_url: str, text: str) -> str:
+    """组装 browser-harness 脚本：开新标签页、点「立即沟通」、填文案、发送、
+    读回确认，finally 里始终关闭标签页。
+
+    登录墙检测复用 collector.boss 的特征串（不重复维护一份），做法是在拿到
+    「立即沟通」按钮之前就先打印 page_info() 和一段正文摘要——即使后面因为
+    按钮找不到而 raise SystemExit，这两行也已经写进了 stdout，调用方在拿到
+    完整输出后统一跑 boss._guard_login 判断是不是登录态失效。
     """
     payload = json.dumps({"url": job_url, "text": text}, ensure_ascii=False)
-    script = "\n".join(
-        [
-            "import json",
-            f"args = json.loads({payload!r})",
-            'goto_url(args["url"])',
-            "wait_for_load()",
-            'nodes = cdp("Accessibility.getFullAXTree")["nodes"]',
-            "target = None",
-            "for n in nodes:",
-            '    name = (n.get("name") or {}).get("value") or ""',
-            '    role = (n.get("role") or {}).get("value") or ""',
-            '    if role == "button" and ("立即沟通" in name or "继续沟通" in name):',
-            '        target = n["backendDOMNodeId"]',
-            "        break",
-            "if target is None:",
-            '    raise SystemExit("找不到「立即沟通」按钮")',
-            'quad = cdp("DOM.getBoxModel", backendNodeId=target)["model"]["content"]',
-            "click_at_xy(sum(quad[0::2]) / 4, sum(quad[1::2]) / 4)",
-            "wait_for_load()",
-            f"ok = js({_FOCUS_INPUT_JS!r})",
-            'if ok != "ok":',
-            '    raise SystemExit("找不到聊天输入框: " + str(ok))',
-            'cdp("Input.insertText", text=args["text"])',
-            f"sent = js({_CLICK_SEND_JS!r})",
-            'if sent != "ok":',
-            '    raise SystemExit("找不到发送按钮: " + str(sent))',
-            'print("SENT_OK")',
-        ]
-    )
-    out = run_script(script)
+    lines = [
+        "import json",
+        f"args = json.loads({payload!r})",
+        'new_tab(args["url"])',
+        "try:",
+        "    wait_for_load()",
+        "    print('###PAGEINFO###' + str(page_info()))",
+        "    body = js('return document.body.innerText.slice(0, 2000);')",
+        "    print('###BODY###' + str(body))",
+        '    nodes = cdp("Accessibility.getFullAXTree")["nodes"]',
+        "    target = None",
+        "    for n in nodes:",
+        '        name = (n.get("name") or {}).get("value") or ""',
+        '        role = (n.get("role") or {}).get("value") or ""',
+        '        if role == "button" and ("立即沟通" in name or "继续沟通" in name):',
+        '            target = n["backendDOMNodeId"]',
+        "            break",
+        "    if target is None:",
+        '        raise SystemExit("找不到「立即沟通」按钮")',
+        '    quad = cdp("DOM.getBoxModel", backendNodeId=target)["model"]["content"]',
+        "    click_at_xy(sum(quad[0::2]) / 4, sum(quad[1::2]) / 4)",
+        "    wait_for_load()",
+        f"    found = wait_for_element({boss.SELECTORS['chat_input']!r}, "
+        f"timeout={boss.POLL_TIMEOUT})",
+        "    if not found:",
+        '        raise SystemExit("聊天输入框在超时内未出现")',
+        f"    ok = js({_FOCUS_INPUT_JS!r})",
+        '    if ok != "ok":',
+        '        raise SystemExit("找不到聊天输入框: " + str(ok))',
+        '    cdp("Input.insertText", text=args["text"])',
+        f"    sent = js({_CLICK_SEND_JS!r})",
+        '    if sent != "ok":',
+        '        raise SystemExit("找不到发送按钮: " + str(sent))',
+        f"    confirm_raw = js({_CONFIRM_SENT_JS!r})",
+        "    confirm = json.loads(confirm_raw)",
+        '    composer_text = (confirm.get("composer_text") or "").strip()',
+        '    last_bubble = confirm.get("last_bubble_text") or ""',
+        '    if composer_text != "":',
+        '        raise SystemExit('
+        '"发送后聊天框未清空，怀疑未真正发送: " + composer_text[:200])',
+        '    expected_prefix = args["text"][:20]',
+        "    if expected_prefix and expected_prefix not in last_bubble:",
+        '        raise SystemExit('
+        '"发送后最新消息未包含文案前缀，怀疑发送失败: " + last_bubble[:200])',
+        '    print("SENT_OK")',
+        "finally:",
+        "    close_tab()",
+    ]
+    return "\n".join(lines)
+
+
+def send_greeting(job_url: str, text: str) -> None:
+    """真实浏览器动作：开新标签页，打开岗位详情页，点「立即沟通」，填文案，
+    发送，读回确认，最后无论成功失败都关闭这个标签页。
+
+    按钮用无障碍树按名字找而不是靠 CSS 类名 —— Boss 的类名比按钮文案更容易变。
+    登录墙复用 collector.boss 的 LoginRequired/_guard_login，让调用方
+    （run_queue）能把它和「这一条消息发送失败」区分开、整轮中止而不是逐行
+    耗到超时。
+    """
+    out = boss.run_script(_build_send_script(job_url, text))
+    boss._guard_login(out)
     if "SENT_OK" not in out:
         raise RuntimeError(f"发送未确认成功：{out[-500:]}")
 
@@ -100,7 +157,8 @@ def _record_application(
     conn: sqlite3.Connection, action_row: sqlite3.Row, greeting: str
 ) -> None:
     job = conn.execute(
-        "SELECT hr_name FROM jobs WHERE job_id = ?", (action_row["job_id"],)
+        "SELECT hr_name FROM jobs WHERE job_id = ? AND platform = 'boss'",
+        (action_row["job_id"],),
     ).fetchone()
     score = conn.execute(
         "SELECT total, dimensions, scorer_version FROM scores WHERE job_id = ?",
@@ -147,15 +205,47 @@ def run_queue(
         if index > 0:
             sleep_fn(human_delay(rng))
 
+        # 认领这一行：把「来源状态是否允许」折进原子 UPDATE，而不是先读一次
+        # 状态再决定发不发——两次读写之间人工可能已经在面板上点了「跳过」，
+        # 或者另一个执行器进程已经抢先认领了它。认领失败说明这一行此刻已经
+        # 不再可发，直接跳过、不调用 send_fn，继续处理队列里剩下的行。
+        try:
+            actions.mark_sending(conn, row["id"])
+        except actions.InvalidTransition:
+            report.skipped += 1
+            continue
+
         payload = json.loads(row["payload"])
         greeting = payload.get("greeting", "")
         job = conn.execute(
-            "SELECT url FROM jobs WHERE job_id = ?", (row["job_id"],)
+            "SELECT url FROM jobs WHERE job_id = ? AND platform = 'boss'",
+            (row["job_id"],),
         ).fetchone()
         url = (job["url"] if job else None) or ""
+        if not url:
+            # 缺 URL 就不该打开浏览器再失败——那样真实的 send_fn 会导航到
+            # 空地址，白白多等一轮超时才报错。这一行已经被认领成 sending，
+            # 所以 mark_failed 从 sending 出发是合法迁移。
+            actions.mark_failed(conn, row["id"], "岗位缺少可用的 URL，未打开浏览器")
+            report.failed += 1
+            report.errors.append(f"{row['job_id']}: 岗位缺少可用的 URL")
+            continue
 
         try:
             send_fn(url, greeting)
+        except boss.LoginRequired as exc:
+            # 登录墙不是「这一条消息发失败了」，而是整个 Boss 会话失效——
+            # 继续跑只会让剩下的每一行都重复同样的失败，还各自耗掉一次
+            # 5-600s 的人类延迟。整轮中止，让调用方在报告里挂横幅。
+            # 这一行已经认领成 sending，标记失败留痕；不直接改回 approved：
+            # 状态机里 sending 只能走向 sent 或 failed，直接跳回 approved
+            # 属于「自动恢复」，而登录墙触发的时点无法百分之百排除消息已经
+            # 发出的可能——诚实地留给人工核实，而不是自动重新排队。
+            actions.mark_failed(conn, row["id"], f"登录态失效，运行已中止：{exc}")
+            report.failed += 1
+            report.login_required = True
+            report.errors.append(f"{row['job_id']}: 登录态失效，运行已中止")
+            break
         except Exception as exc:  # 任何失败都只留痕，不自动重试
             actions.mark_failed(conn, row["id"], str(exc))
             report.failed += 1
@@ -163,7 +253,14 @@ def run_queue(
             continue
 
         actions.mark_sent(conn, row["id"])
-        _record_application(conn, row, greeting)
+        try:
+            _record_application(conn, row, greeting)
+        except Exception as exc:
+            # 消息已经发出、状态也已经落成 sent，这一步只是写申请台账。
+            # 台账写失败不能让异常带着「消息已发出」的事实一起从 run_queue
+            # 里逃出去——那样 report 会被整个丢弃，队列里剩下的行也不会
+            # 再被处理。留痕即可，继续下一行。
+            report.errors.append(f"{row['job_id']}: 申请台账写入失败：{exc}")
         report.sent += 1
 
     return report

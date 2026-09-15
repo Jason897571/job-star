@@ -6,6 +6,7 @@ from jobstar.actions import (
     APPROVED,
     FAILED,
     PENDING,
+    SENDING,
     SENT,
     SKIPPED,
     InvalidTransition,
@@ -13,6 +14,7 @@ from jobstar.actions import (
     enqueue,
     list_by_status,
     mark_failed,
+    mark_sending,
     mark_sent,
     remaining_quota,
     sent_today,
@@ -79,13 +81,44 @@ def test_pending_cannot_jump_to_sent(conn):
         mark_sent(conn, action_id)
 
 
-def test_approved_can_be_sent(conn):
+def test_approved_can_be_claimed_as_sending(conn):
+    """approved → sending：执行器发送前的原子认领，见 mark_sending 文档字符串。"""
     action_id = _new(conn)
     approve(conn, action_id)
+    mark_sending(conn, action_id)
+    row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert row["status"] == SENDING
+    assert row["sent_at"] is not None
+
+
+def test_approved_cannot_jump_straight_to_sent(conn):
+    """sent 只能从 sending 到达，approved 必须先被 mark_sending 认领。"""
+    action_id = _new(conn)
+    approve(conn, action_id)
+    with pytest.raises(InvalidTransition):
+        mark_sent(conn, action_id)
+
+
+def test_sending_can_be_sent(conn):
+    action_id = _new(conn)
+    approve(conn, action_id)
+    mark_sending(conn, action_id)
     mark_sent(conn, action_id)
     row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
     assert row["status"] == SENT
     assert row["sent_at"] is not None
+
+
+def test_sending_can_fail_with_reason(conn):
+    """sending → failed：发送过程中出异常（含登录墙中止），运行要能继续
+    而不是被这里的 InvalidTransition 拖垮。"""
+    action_id = _new(conn)
+    approve(conn, action_id)
+    mark_sending(conn, action_id)
+    mark_failed(conn, action_id, "登录态失效")
+    row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert row["status"] == FAILED
+    assert "登录态失效" in row["error"]
 
 
 def test_approved_can_fail_with_reason(conn):
@@ -110,6 +143,7 @@ def test_failed_can_be_re_approved(conn):
 def test_sent_is_terminal(conn):
     action_id = _new(conn)
     approve(conn, action_id)
+    mark_sending(conn, action_id)
     mark_sent(conn, action_id)
     with pytest.raises(InvalidTransition):
         approve(conn, action_id)
@@ -133,10 +167,19 @@ def test_sent_today_counts_only_today(conn):
     for i in range(3):
         aid = _new(conn, job_id=f"j{i}")
         approve(conn, aid)
+        mark_sending(conn, aid)
         mark_sent(conn, aid)
     conn.execute("UPDATE actions SET sent_at='2020-01-01 00:00:00' WHERE job_id='j0'")
     conn.commit()
     assert sent_today(conn) == 2
+
+
+def test_sent_today_counts_sending_too(conn):
+    """崩溃的运行不能把配额还给可能已经发出去的消息：sending 也要计数。"""
+    aid = _new(conn)
+    approve(conn, aid)
+    mark_sending(conn, aid)
+    assert sent_today(conn) == 1
 
 
 def test_remaining_quota_respects_setting(conn):
@@ -144,6 +187,7 @@ def test_remaining_quota_respects_setting(conn):
     assert remaining_quota(conn) == 2
     aid = _new(conn)
     approve(conn, aid)
+    mark_sending(conn, aid)
     mark_sent(conn, aid)
     assert remaining_quota(conn) == 1
 
@@ -153,6 +197,7 @@ def test_remaining_quota_never_negative(conn):
     for i in range(3):
         aid = _new(conn, job_id=f"j{i}")
         approve(conn, aid)
+        mark_sending(conn, aid)
         mark_sent(conn, aid)
     assert remaining_quota(conn) == 0
 
@@ -162,17 +207,24 @@ def test_unknown_action_id_raises(conn):
         approve(conn, 9999)
 
 
-@pytest.mark.parametrize("prior_state", ["pending", "skipped", "failed", "sent"])
-def test_mark_sent_rejected_from_every_non_approved_state(conn, prior_state):
-    """安全线的参数化版本：sent 只能从 approved 到达，其余任何状态都必须拒绝。"""
+@pytest.mark.parametrize(
+    "prior_state", ["pending", "approved", "skipped", "failed", "sent"]
+)
+def test_mark_sent_rejected_from_every_non_sending_state(conn, prior_state):
+    """安全线的参数化版本：sent 只能从 sending 到达，其余任何状态都必须拒绝——
+    包括 approved 本身：必须先被 mark_sending 认领才能变 sent，不能直接跳过去。
+    """
     action_id = _new(conn)
-    if prior_state == "skipped":
+    if prior_state == "approved":
+        approve(conn, action_id)
+    elif prior_state == "skipped":
         skip(conn, action_id)
     elif prior_state == "failed":
         approve(conn, action_id)
         mark_failed(conn, action_id, "boom")
     elif prior_state == "sent":
         approve(conn, action_id)
+        mark_sending(conn, action_id)
         mark_sent(conn, action_id)
 
     with pytest.raises(InvalidTransition):
@@ -183,6 +235,7 @@ def test_reenqueue_after_sent_does_not_revive(conn):
     """已发送的行重新入队不应该复活或被新 payload 覆盖。"""
     action_id = _new(conn)
     approve(conn, action_id)
+    mark_sending(conn, action_id)
     mark_sent(conn, action_id)
     again = enqueue(
         conn, type="send_greeting", job_id="j1", payload={"greeting": "新文案"}
@@ -261,6 +314,7 @@ def test_rejected_approve_releases_lock_for_other_connections(conn, tmp_path):
     """
     action_id = _new(conn)
     approve(conn, action_id)
+    mark_sending(conn, action_id)
     mark_sent(conn, action_id)
 
     with pytest.raises(InvalidTransition):
@@ -349,6 +403,7 @@ def test_sent_today_counts_previous_utc_day_current_local_day(conn, monkeypatch)
 
         action_id = _new(conn)
         approve(conn, action_id)
+        mark_sending(conn, action_id)
         mark_sent(conn, action_id)
         conn.execute(
             "UPDATE actions SET sent_at=? WHERE id=?", (sent_at_value, action_id)

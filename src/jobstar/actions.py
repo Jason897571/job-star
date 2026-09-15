@@ -1,15 +1,24 @@
 """待确认队列。状态机是「绝不自动发送」的结构性保证。
 
-pending  → approved → sent
+pending  → approved → sending → sent
 pending  → skipped
-approved → failed
 approved → skipped
+approved → failed
 approved → approved（幂等重新确认，允许编辑后再次确认）
+sending  → failed
 skipped  → approved
 failed   → approved
 failed   → skipped（彻底放弃，例如岗位已下架）
 
-只有 approved 能变 sent，而 approved 只由面板上的人工点击写入。
+只有 approved 能变 sending，只有 sending 能变 sent——执行器发送前必须先把
+这一行原子地「认领」成 sending（CAS：同一条 UPDATE ... WHERE status='approved'
+只可能有 0 或 1 行受影响）。这样人工在发送前一刻点「跳过」永远赢：认领失败
+时执行器直接跳过这一行，绝不会把消息发给一个已经被人回绝的人；两个执行器
+抢同一行时也是恰好一个赢。
+
+sending 是「消息可能已经发出、但还没确认」的诚实中间态，不会被自动回收：
+进程被打断（Ctrl-C、宕机）留在 sending 的行，下一轮执行器读不到它（它已经
+不是 approved），因此不会被重发；面板把它留给人工核实。
 """
 
 from __future__ import annotations
@@ -20,6 +29,7 @@ import sqlite3
 PENDING = "pending"
 APPROVED = "approved"
 SKIPPED = "skipped"
+SENDING = "sending"
 SENT = "sent"
 FAILED = "failed"
 
@@ -27,8 +37,9 @@ FAILED = "failed"
 _ALLOWED_FROM: dict[str, frozenset[str]] = {
     APPROVED: frozenset({PENDING, SKIPPED, FAILED, APPROVED}),
     SKIPPED: frozenset({PENDING, APPROVED, FAILED}),
-    SENT: frozenset({APPROVED}),
-    FAILED: frozenset({APPROVED}),
+    SENDING: frozenset({APPROVED}),
+    SENT: frozenset({SENDING}),
+    FAILED: frozenset({APPROVED, SENDING}),
 }
 
 
@@ -149,6 +160,27 @@ def skip(conn: sqlite3.Connection, action_id: int) -> None:
     )
 
 
+def mark_sending(conn: sqlite3.Connection, action_id: int) -> None:
+    """执行器发送前的原子认领：approved → sending。
+
+    与 mark_sent/mark_failed 共用 `_atomic_transition`：谁的 UPDATE 先落地
+    谁就赢得这一行，另一个只拿到 InvalidTransition——两个执行器抢同一行，
+    或执行器与人工的「跳过」抢同一行，都不会两边都把消息发出去。
+
+    这里顺带盖 sent_at（而不是等 mark_sent 才盖）：sent_today/remaining_quota
+    把 sending 也计入今日配额（见 sent_today 的注释），复用同一个 sent_at
+    列，而不是新开一列只为了这一个状态。mark_sent 成功后会再盖一次，语义
+    上是「确认发送时间」，同一天内不影响配额计数。
+    """
+    _atomic_transition(
+        conn,
+        action_id,
+        SENDING,
+        "status=?, sent_at=datetime('now')",
+        (SENDING,),
+    )
+
+
 def mark_sent(conn: sqlite3.Connection, action_id: int) -> None:
     _atomic_transition(
         conn,
@@ -177,10 +209,18 @@ def list_by_status(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
 
 
 def sent_today(conn: sqlite3.Connection) -> int:
+    """今天已发送、或可能已发送（sending：进程被打断时的诚实中间态）的数量。
+
+    sending 必须计入，否则一次崩溃的运行会把配额还给可能已经发出去的消息——
+    执行器下一轮不会重发 sending 行，但如果配额没被占住，就会去发送队列里
+    下一批 approved 的行，实际发送量就超过了每日上限。sending 和 sent 共用
+    同一个 sent_at 列（mark_sending 认领时盖一次，mark_sent 成功后再刷新一
+    次），所以这里按 date(sent_at,'localtime') 筛今天的写法不用变。
+    """
     row = conn.execute(
         "SELECT COUNT(*) AS n FROM actions "
-        "WHERE status = ? AND date(sent_at, 'localtime') = date('now', 'localtime')",
-        (SENT,),
+        "WHERE status IN (?, ?) AND date(sent_at, 'localtime') = date('now', 'localtime')",
+        (SENT, SENDING),
     ).fetchone()
     return int(row["n"])
 

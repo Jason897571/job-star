@@ -34,6 +34,13 @@ BASE = "https://www.zhipin.com"
 #   detail_salary 特意加了 .company-info 前缀限定作用域：不加前缀的裸 .badge
 #   在当前页面唯一，但 .company-info .badge 更贴近语义、更不容易在未来改版时
 #   撞上别的 "热门"/推荐徽章。
+# - chat_input / chat_send / chat_outgoing_bubble（2026-09-15 新增，UNVERIFIED）：
+#   执行器发消息用的聊天框/发送按钮/我方消息气泡选择器。这三个是执行器任务
+#   要求「不打开浏览器就不能核实」的产物——本次修复只能凭常见命名猜测，从未
+#   在活体聊天页上跑过 wait_for_element/querySelector 验证。上线前必须用
+#   browser-harness 打开一次真实会话页面重新校准，否则「聊天框在超时内未
+#   出现」「发送后最新消息未包含文案前缀」这类失败可能只是选择器猜错，而不
+#   是真的登录墙或发送失败。
 SELECTORS: dict[str, str] = {
     "card": "li.job-card-box",
     "link": "a.job-name",
@@ -47,6 +54,9 @@ SELECTORS: dict[str, str] = {
     "detail_company": ".company-info",
     "detail_hr": ".job-boss-info .name",
     "detail_salary": ".company-info .badge",
+    "chat_input": "#chat-input, textarea.input-area, div[contenteditable=true]",  # UNVERIFIED
+    "chat_send": ".btn-send, button[type=submit]",  # UNVERIFIED
+    "chat_outgoing_bubble": ".chat-message.self:last-child, .message-item.mine:last-child",  # UNVERIFIED
 }
 
 # 登录墙的特征串。命中就中止采集，面板顶部挂横幅（设计文档 §7）。
@@ -84,7 +94,12 @@ def run_script(script: str, timeout: int = 180) -> str:
         raise CollectError("browser-harness 不在 PATH 上")
     try:
         proc = subprocess.run(
-            [exe], input=script, capture_output=True, text=True, timeout=timeout
+            [exe],
+            input=script,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
         raise CollectError(f"browser-harness 执行超时（>{timeout}s）") from exc
