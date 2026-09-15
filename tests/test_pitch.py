@@ -117,7 +117,10 @@ def test_system_prompt_forbids_template_openings(monkeypatch):
     """前 20 字相似度是风控信号之一。"""
     calls = _stub(monkeypatch, "文案")
     write_pitch(req=REQ, result=RESULT, cards=CARDS, title="AI 后端", company="某司")
-    assert "开头" in calls[0]["system"]
+    system = calls[0]["system"]
+    assert "您好，我看到贵公司" in system
+    assert "您好，我对这个岗位" in system
+    assert "不要以" in system
 
 
 def test_truncates_overlong_output(monkeypatch):
@@ -130,6 +133,39 @@ def test_strips_surrounding_quotes(monkeypatch):
     _stub(monkeypatch, '"您好，我对这个岗位很感兴趣"')
     out = write_pitch(req=REQ, result=RESULT, cards=CARDS, title="t", company="c")
     assert not out.startswith('"')
+
+
+def test_strips_surrounding_curly_quotes(monkeypatch):
+    _stub(monkeypatch, "“您好，看到贵司在做 RAG 检索问答……”")
+    out = write_pitch(req=REQ, result=RESULT, cards=CARDS, title="t", company="c")
+    assert not out.startswith("“")
+    assert not out.endswith("”")
+    assert out == "您好，看到贵司在做 RAG 检索问答……"
+
+
+def test_strips_surrounding_curly_quotes_preserves_inner_ascii_quote(monkeypatch):
+    _stub(monkeypatch, '“您好，看到贵司在做"检索增强"项目……”')
+    out = write_pitch(req=REQ, result=RESULT, cards=CARDS, title="t", company="c")
+    assert not out.startswith("“")
+    assert not out.endswith("”")
+    assert '"检索增强"' in out
+
+
+def test_prompt_excludes_card_cited_only_by_zero_scored_dimension(monkeypatch):
+    """打分为 0 的维度不算数，哪怕它带了看起来有效的 card_ids。"""
+    calls = _stub(monkeypatch, "文案")
+    result = ScoreResult(
+        job_id="j1",
+        total=50,
+        dimensions=(
+            DimensionScore("skills", 80, ("cap-rag",), "r", "g"),
+            DimensionScore("bonus", 0.0, ("cap-gw",), "reason-but-zero", "gap"),
+        ),
+        scorer_version="v1",
+    )
+    write_pitch(req=REQ, result=result, cards=CARDS, title="AI 后端", company="某司")
+    assert "cap-rag" in calls[0]["user"]
+    assert "cap-gw" not in calls[0]["user"]
 
 
 def test_raises_when_model_returns_empty(monkeypatch):

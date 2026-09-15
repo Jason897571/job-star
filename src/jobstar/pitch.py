@@ -34,7 +34,8 @@ def write_pitch(
 ) -> str:
     cited: set[str] = set()
     for dim in result.dimensions:
-        cited.update(dim.card_ids)
+        if dim.score > 0:
+            cited.update(dim.card_ids)
     card_index = {c.id: c for c in cards}
 
     card_lines = [
@@ -61,7 +62,7 @@ def write_pitch(
     )
 
     data = call_json(system=SYSTEM, user=user, tier="strong")
-    text = str(data.get("greeting") or "").strip().strip('"').strip('"').strip('"').strip()
+    text = str(data.get("greeting") or "").strip().strip('"').strip("“”").strip()
     if not text:
         raise ValueError("话术生成器返回空文本")
     return text[:MAX_CHARS]
