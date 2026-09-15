@@ -5038,7 +5038,7 @@ render();
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_panel.py -v`
-Expected: 14 passed
+Expected: 13 passed
 
 - [ ] **Step 6: 跑全套回归**
 
