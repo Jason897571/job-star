@@ -76,7 +76,7 @@ def test_dedup_keeps_first_occurrence_per_job_id():
 def test_fixture_round_trip():
     raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
     items = dedup([i for i in (normalize_list_item(r) for r in raw) if i])
-    assert len(items) >= 2, "fixture 去重后至少剩两条"
+    assert len(items) == 3, "fixture 去重后应剩 3 条（5 条原始记录：1 条重复、1 条脏数据）"
     assert all(i["job_id"] for i in items)
     assert all(i["title"] for i in items)
     assert len({i["job_id"] for i in items}) == len(items)
