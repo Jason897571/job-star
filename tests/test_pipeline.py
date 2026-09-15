@@ -140,6 +140,45 @@ def test_run_collect_skips_already_collected(conn):
     assert row["raw_jd"] == "第一次"
 
 
+def test_run_collect_login_required_propagates_and_stops_mid_batch(conn):
+    """登录态失效是会话级别的硬故障：不能被当成普通的单条采集失败吞掉。
+    第二个门禁幸存者的详情页请求触发 LoginRequired 后，应当整个往外炸穿，
+    且第三个幸存者完全不应该再被尝试。"""
+    from jobstar.collector import boss
+
+    listed = [
+        {
+            "job_id": f"keep{i}",
+            "url": f"https://x/job_detail/keep{i}~.html",
+            "title": "后端",
+            "company": "A",
+            "city": "杭州",
+            "salary_raw": "30-50K",
+            "hr_name": "张",
+            "tags": ["3-5年", "本科"],
+        }
+        for i in range(1, 4)
+    ]
+    detail_calls = []
+
+    def detail_fn(url):
+        detail_calls.append(url)
+        if len(detail_calls) == 2:
+            raise boss.LoginRequired("登录态失效")
+        return {"raw_jd": "JD 全文"}
+
+    with pytest.raises(boss.LoginRequired):
+        run_collect(
+            conn,
+            keyword="后端",
+            city_code="101210100",
+            fetch_fn=lambda **kw: listed,
+            detail_fn=detail_fn,
+        )
+
+    assert len(detail_calls) == 2, "第三个幸存者不应该再被尝试详情页请求"
+
+
 def test_run_score_marks_failure_without_guessing(conn, monkeypatch):
     from jobstar.llm import LLMSchemaError
 
@@ -183,6 +222,24 @@ def test_maybe_enqueue_creates_pending_action_above_threshold(conn, monkeypatch)
     assert action_id is not None
     row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
     assert row["status"] == PENDING
+
+
+def test_maybe_enqueue_reuses_passed_in_cards_instead_of_reloading(conn, monkeypatch):
+    """run_score 已经加载过一次卡片库；传了 cards 进来就不该再读一遍磁盘。"""
+    set_setting(conn, "score_threshold", 70)
+
+    def boom(path):
+        raise AssertionError("cards 已经传入，不应该再次从磁盘加载")
+
+    monkeypatch.setattr("jobstar.pipeline.load_cards", boom)
+    monkeypatch.setattr("jobstar.pipeline.write_pitch", lambda **kw: "定制开场白")
+    req = JobRequirements(
+        "j1", "杭州", None, None, None, None, None, (), None, None, None
+    )
+    result = ScoreResult("j1", 82.0, (DimensionScore("skills", 82, ("a",), "", ""),), "v1")
+    action_id = maybe_enqueue(conn, req, result, title="t", company="c", cards=())
+    assert action_id is not None
+    row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
     assert json.loads(row["payload"])["greeting"] == "定制开场白"
 
 

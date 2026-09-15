@@ -16,7 +16,7 @@ from jobstar import actions, gate
 from jobstar.config import get_setting, get_settings
 from jobstar.evidence import load_cards
 from jobstar.llm import LLMBackendError, LLMSchemaError
-from jobstar.models import JobRequirements
+from jobstar.models import CapabilityCard, JobRequirements
 from jobstar.normalizer import (
     normalize,
     parse_salary_raw,
@@ -102,6 +102,14 @@ def prelim_requirements(
     )
 
 
+def _gate_rules(conn: sqlite3.Connection) -> dict:
+    """拼装门禁规则：settings 里的 gate_rules 加上 my_degree（硬性学历项存在
+    单独的配置键里，不属于 gate_rules 本身，但门禁判断时要和其余规则一起传入）。"""
+    rules = dict(get_setting(conn, "gate_rules"))
+    rules.setdefault("my_degree", get_setting(conn, "my_degree"))
+    return rules
+
+
 def run_collect(
     conn: sqlite3.Connection,
     *,
@@ -130,8 +138,7 @@ def run_collect(
     report.listed = len(items)
     report.new = boss.save_jobs(conn, items)
 
-    rules = dict(get_setting(conn, "gate_rules"))
-    rules.setdefault("my_degree", get_setting(conn, "my_degree"))
+    rules = _gate_rules(conn)
 
     for item in items:
         row = conn.execute(
@@ -153,6 +160,12 @@ def run_collect(
 
         try:
             detail = detail_fn(row["url"])
+        except boss.LoginRequired:
+            # 登录态失效是会话级别的硬故障：不能当成这一条岗位的采集失败吞掉、
+            # 继续对下一个门禁幸存者发详情页请求——那样只会拿一个已经失效的
+            # 会话再打一堆请求，攒出一屏迷惑性的单条错误，而不是一次响亮、
+            # 立刻能看懂的“重新登录再跑”信号。让它照原样往外炸穿。
+            raise
         except Exception as exc:
             report.errors.append(f"{row['job_id']}: {exc}")
             continue
@@ -169,12 +182,18 @@ def maybe_enqueue(
     *,
     title: str,
     company: str,
+    cards: tuple[CapabilityCard, ...] | None = None,
 ) -> int | None:
-    """总分达到阈值才生成待确认动作。阈值为 None（冷启动期）时永远不生成。"""
+    """总分达到阈值才生成待确认动作。阈值为 None（冷启动期）时永远不生成。
+
+    `cards` 让调用方复用已经加载过的卡片库（run_score 每轮只加载一次），不传时
+    退化为自己读一遍——直接调用 maybe_enqueue 的既有测试不用改。
+    """
     threshold = get_setting(conn, "score_threshold")
     if threshold is None or result.total < float(threshold):
         return None
-    cards = load_cards(get_settings().cards_path)
+    if cards is None:
+        cards = load_cards(get_settings().cards_path)
     greeting = write_pitch(
         req=req, result=result, cards=cards, title=title, company=company
     )
@@ -202,8 +221,7 @@ def run_score(conn: sqlite3.Connection, *, limit: int | None = None) -> ScoreRep
 
     cards = load_cards(get_settings().cards_path)
     weights = get_setting(conn, "dimension_weights")
-    rules = dict(get_setting(conn, "gate_rules"))
-    rules.setdefault("my_degree", get_setting(conn, "my_degree"))
+    rules = _gate_rules(conn)
 
     for row in rows:
         try:
@@ -244,7 +262,12 @@ def run_score(conn: sqlite3.Connection, *, limit: int | None = None) -> ScoreRep
 
         try:
             if maybe_enqueue(
-                conn, req, result, title=row["title"], company=row["company"] or ""
+                conn,
+                req,
+                result,
+                title=row["title"],
+                company=row["company"] or "",
+                cards=cards,
             ) is not None:
                 report.enqueued += 1
         except (LLMSchemaError, LLMBackendError, ValueError) as exc:

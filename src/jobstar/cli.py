@@ -54,14 +54,16 @@ def main(argv: list[str] | None = None) -> int:
             # CollectError（二者在采集器这一层无法区分），run_collect 把它
             # 转成了 report.errors 里的一条记录而不是让异常往外炸。这里不
             # 装作能分辨到底是哪一种，只如实告诉用户这条歧义，让人自己去
-            # Boss 上核实关键词是否真的没有匹配。
+            # Boss 上核实关键词是否真的没有匹配。report.errors 在这条路径下
+            # 只有这一条、且说的是同一件事，不再用下面的通用循环重复打印一遍。
             print(
                 "  ⚠️  本次没有抓到任何列表条目——可能是关键词真的零匹配，"
                 "也可能是页面被拦截，无法自动区分，请人工核实",
                 file=sys.stderr,
             )
-        for err in report.errors:
-            print(f"  ! {err}", file=sys.stderr)
+        else:
+            for err in report.errors:
+                print(f"  ! {err}", file=sys.stderr)
         return 0
 
     if args.cmd == "score":
