@@ -48,9 +48,13 @@ def main(argv: list[str] | None = None) -> int:
 
         # 采集健康状态（Task 13）：写进 settings，供面板顶部横幅读取
         # （/api/health）。这是被动信号——只在真的跑了一次 collect 之后才
-        # 更新，没有主动探活；last_collect_at 记的是「上一次跑 collect 的
-        # 时间」，成功失败都更新，跟 last_collect_error 是否有内容是两件事。
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 更新，没有主动探活。last_collect_at 记的是「最近一次尝试」的完成
+        # 时刻，成功失败都更新；last_collect_ok_at 只在真正成功（清空
+        # last_collect_error 的同一条路径）时才前进。二者不相等，就说明
+        # 最近一次尝试其实失败了——横幅据此判断能不能说「未见异常」，不能
+        # 只看 last_collect_error 是否已被人工点掉（fix round 1，review
+        # finding 1）。时间戳都在 run_collect 跑完/抛出之后才取，反映的是
+        # 「这次尝试结束的时刻」而不是开始的时刻（fix round 1，finding 2）。
         try:
             report = run_collect(
                 conn, keyword=args.keyword, city_code=args.city, pages=args.pages
@@ -59,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
             # run_collect 故意让 LoginRequired 原样往外炸穿（见 pipeline.py
             # 的注释）——登录态失效是会话级别的硬故障，不能被当成这一条采集
             # 的失败吞掉。这里接住它、写健康状态、给出明确的下一步动作。
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             set_setting(
                 conn, "last_collect_error", f"Boss 登录态失效，采集已中止：{exc}"
             )
@@ -70,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(
             f"列表 {report.listed} 条，新增 {report.new}，"
             f"预门禁刷掉 {report.gated_out}，抓详情 {report.detail_fetched}"
@@ -99,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 set_setting(conn, "last_collect_error", None)
+                set_setting(conn, "last_collect_ok_at", now)
         set_setting(conn, "last_collect_at", now)
         return 0
 

@@ -143,3 +143,84 @@ def test_collect_clean_run_clears_previous_health_error(monkeypatch, tmp_path):
     conn2 = get_conn(tmp_path / "t.db")
     assert get_setting(conn2, "last_collect_error") is None
     assert get_setting(conn2, "last_collect_at") is not None
+
+
+# --- fix round 1（review finding 1）：last_collect_at 记的是「最近一次
+# 尝试」，成功失败都前进；last_collect_ok_at 只在真正成功（清空
+# last_collect_error 的同一条路径）时才前进。下面三个用例分别覆盖：干净
+# 采集会把两者对齐，登录态失效和结构变更两条失败路径都不能推进
+# last_collect_ok_at——否则人工点掉错误横幅后，横幅会把失败的那次尝试
+# 误报成「未见异常」（review 复现的复合场景）。
+
+
+def test_collect_clean_run_sets_last_collect_ok_at_equal_to_at(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+
+    def fake_run_collect(conn, *, keyword, city_code, pages):
+        return CollectReport(listed=3, new=3, gated_out=0, detail_fetched=3, errors=[])
+
+    monkeypatch.setattr("jobstar.pipeline.run_collect", fake_run_collect)
+
+    exit_code = main(["collect", "--keyword", "AI 后端"])
+    assert exit_code == 0
+
+    conn = get_conn(tmp_path / "t.db")
+    at = get_setting(conn, "last_collect_at")
+    assert at is not None
+    assert get_setting(conn, "last_collect_ok_at") == at
+
+
+def test_collect_login_required_does_not_advance_ok_at(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+    from jobstar.config import set_setting
+    from jobstar.db import init_db
+
+    conn = get_conn(tmp_path / "t.db")
+    init_db(conn)
+    set_setting(conn, "last_collect_ok_at", "2026-09-01 08:00:00")
+
+    def fake_run_collect(conn, *, keyword, city_code, pages):
+        raise LoginRequired("检测到登录墙")
+
+    monkeypatch.setattr("jobstar.pipeline.run_collect", fake_run_collect)
+
+    exit_code = main(["collect", "--keyword", "AI 后端"])
+    assert exit_code == 2
+
+    conn2 = get_conn(tmp_path / "t.db")
+    assert get_setting(conn2, "last_collect_ok_at") == "2026-09-01 08:00:00"
+    assert get_setting(conn2, "last_collect_at") != "2026-09-01 08:00:00"
+
+
+def test_collect_structural_change_does_not_advance_ok_at(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+    from jobstar.config import set_setting
+    from jobstar.db import init_db
+
+    conn = get_conn(tmp_path / "t.db")
+    init_db(conn)
+    set_setting(conn, "last_collect_ok_at", "2026-09-01 08:00:00")
+
+    def fake_run_collect(conn, *, keyword, city_code, pages):
+        return CollectReport(
+            listed=5,
+            new=2,
+            gated_out=1,
+            detail_fetched=1,
+            errors=["j1: 详情页轮询超时"],
+        )
+
+    monkeypatch.setattr("jobstar.pipeline.run_collect", fake_run_collect)
+
+    exit_code = main(["collect", "--keyword", "AI 后端"])
+    assert exit_code == 0
+
+    conn2 = get_conn(tmp_path / "t.db")
+    assert get_setting(conn2, "last_collect_ok_at") == "2026-09-01 08:00:00"
+    assert get_setting(conn2, "last_collect_at") != "2026-09-01 08:00:00"

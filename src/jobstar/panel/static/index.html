@@ -62,11 +62,22 @@ async function bar() {
   // 观察到的结果，不是主动的实时探活——所以措辞里如实带出「上次采集」
   // 而不是暗示"现在"的状态。last_collect_error 为空时不代表零结果一定是
   // 真实零匹配：这一层从采集器开始就无法区分"关键词零结果"和"页面被拦截"。
+  //
+  // fix round 1（review finding 1）：last_collect_at 是「最近一次尝试」，
+  // 成功失败都会前进；last_collect_ok_at 只在真正成功时才前进。人工点掉
+  // 错误横幅只清 last_collect_error，不清 last_collect_at——如果这里只看
+  // last_collect_error 是否为空就说「未见异常」，会把刚被点掉的那次失败
+  // 尝试说成是干净的。只有两者相等（最近一次尝试就是最近一次成功）才能
+  // 说「未见异常」；否则如实说「尝试过但没成功」，而不是暗示健康。
   if (h.last_collect_error) {
     html += `<br><b class="gap">⚠️ 采集异常（截至上次采集，被动信号）：${esc(h.last_collect_error)}</b> ` +
       `<button id="clear-err">知道了</button>`;
-  } else if (h.last_collect_at) {
+  } else if (h.last_collect_at && h.last_collect_at === h.last_collect_ok_at) {
     html += `<br><span class="meta">上次采集 ${esc(h.last_collect_at)}，未见异常</span>`;
+  } else if (h.last_collect_at && h.last_collect_ok_at) {
+    html += `<br><span class="meta">上次尝试采集 ${esc(h.last_collect_at)}，最近一次成功 ${esc(h.last_collect_ok_at)}</span>`;
+  } else if (h.last_collect_at) {
+    html += `<br><span class="meta">上次尝试采集 ${esc(h.last_collect_at)}，尚无成功记录</span>`;
   }
   $("#bar").innerHTML = html;
   const btn = $("#clear-err");

@@ -38,8 +38,12 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "my_degree": "硕士",
     "my_years": 5,
     # 采集健康状态。由 CLI 的 collect 子命令写入，面板顶部横幅读取（Task 13）。
+    # last_collect_at 记录「最近一次尝试」（不论成败），last_collect_ok_at
+    # 只在真正成功的那次采集上前进——两者不相等时，说明最近一次尝试其实
+    # 失败了，横幅不能据此宣称「未见异常」（fix round 1，review finding 1）。
     "last_collect_error": None,
     "last_collect_at": None,
+    "last_collect_ok_at": None,
 }
 
 
@@ -169,7 +173,7 @@ def validate_setting_value(key: str, value: Any) -> None:
         if not _is_number(value) or value < 0:
             raise ValueError(f"{key} 必须是非负数字")
 
-    elif key in ("last_collect_error", "last_collect_at"):
+    elif key in ("last_collect_error", "last_collect_at", "last_collect_ok_at"):
         if value is not None and not isinstance(value, str):
             raise ValueError(f"{key} 必须是字符串或 null")
 

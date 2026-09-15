@@ -118,8 +118,13 @@ def health(conn: sqlite3.Connection = Depends(get_db)) -> dict:
         # 采集健康状态（Task 13）：由 CLI 的 collect 子命令写入。这是被动
         # 信号——只反映上一次真的跑过 collect 时观察到的结果，没有主动的
         # 活体探测（探测本身要消耗一次页面请求，对账号风控而言不划算）。
+        # last_collect_at 是「最近一次尝试」，last_collect_ok_at 是「最近
+        # 一次成功」——二者不相等时，说明最近一次尝试其实失败了（fix round
+        # 1，review finding 1：不能让人工点掉错误横幅后，横幅转头就用失败
+        # 那次的时间戳宣称「未见异常」）。
         "last_collect_error": get_setting(conn, "last_collect_error"),
         "last_collect_at": get_setting(conn, "last_collect_at"),
+        "last_collect_ok_at": get_setting(conn, "last_collect_ok_at"),
     }
 
 

@@ -79,3 +79,4 @@ def test_collect_health_settings_default_to_none(conn):
     本身缺失的两个键。"""
     assert get_setting(conn, "last_collect_error") is None
     assert get_setting(conn, "last_collect_at") is None
+    assert get_setting(conn, "last_collect_ok_at") is None

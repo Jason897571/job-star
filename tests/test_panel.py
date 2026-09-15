@@ -539,3 +539,44 @@ def test_clear_error_without_panel_header_is_rejected(client):
 
 def test_index_renders_banner_placeholder(client):
     assert "last_collect_error" in client.get("/").text
+
+
+# --- fix round 1（review finding 1）：last_collect_at 现在是「最近一次尝试」，
+# 成功失败都会前进；last_collect_ok_at 只在真正成功时前进。人工点掉错误
+# 横幅（clear-error）只清 last_collect_error，不清 last_collect_at——如果
+# 横幅只看 last_collect_error 是否为空就说「未见异常」，会把刚被点掉的那次
+# 失败尝试说成是干净的，这正是 review 指出的假话。
+
+
+def test_clear_error_does_not_make_failed_attempt_look_clean(client):
+    """review 复现的复合场景：采集失败 → 人工点「知道了」清掉错误 →
+    /api/health 不能把这次失败的尝试说成是「未见异常」的成功采集。"""
+    from jobstar.config import set_setting
+
+    set_setting(client.conn, "last_collect_error", "Boss 登录态失效，采集已中止。")
+    set_setting(client.conn, "last_collect_at", "2026-09-14 10:00:00")
+    set_setting(client.conn, "last_collect_ok_at", "2026-09-10 09:00:00")
+
+    resp = client.post("/api/health/clear-error", headers=PANEL_HEADERS)
+    assert resp.status_code == 200
+
+    body = client.get("/api/health").json()
+    assert body["last_collect_error"] is None
+    # 最近一次尝试（失败的那次）和最近一次成功不是同一个时间戳——横幅必须
+    # 能分辨这一点，不能只看 last_collect_error 是否为空。
+    assert body["last_collect_at"] == "2026-09-14 10:00:00"
+    assert body["last_collect_ok_at"] == "2026-09-10 09:00:00"
+    assert body["last_collect_at"] != body["last_collect_ok_at"]
+
+
+def test_index_banner_guards_no_anomaly_claim_on_mismatch(client):
+    """选择的方案：不在 /api/health 里另加一个服务端计算的布尔字段，而是
+    让前端直接比较 last_collect_at 与 last_collect_ok_at 两个已有字段——
+    二者格式相同（同一个 strftime 出来的字符串），字符串相等判断本身足够
+    简单可靠，不需要为此再造一个「是否健康」的派生字段增加一个新的真相源。
+    这里直接对服务端返回的静态 HTML/JS 源码做结构断言：「未见异常」分支的条件里必须
+    出现两个字段的相等比较，防止将来有人把判断简化回「last_collect_error
+    为空就是未见异常」（也就是 review 指出的那个 bug）。"""
+    html = client.get("/").text
+    assert "last_collect_ok_at" in html
+    assert "h.last_collect_at === h.last_collect_ok_at" in html
