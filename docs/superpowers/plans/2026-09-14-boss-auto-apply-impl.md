@@ -2517,9 +2517,12 @@ def write_pitch(
     title: str,
     company: str,
 ) -> str:
+    # 只收集「被记了分」的维度引用的卡片。打分器允许一个维度 card_ids 非空但
+    # 分数为 0（模型自己给了 0 分），那等于没被采信，不能拿来当话术素材。
     cited: set[str] = set()
     for dim in result.dimensions:
-        cited.update(dim.card_ids)
+        if dim.score > 0:
+            cited.update(dim.card_ids)
     card_index = {c.id: c for c in cards}
 
     card_lines = [
