@@ -1,11 +1,14 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from jobstar.collector.parse import (
     clean_text,
     dedup,
     extract_job_id,
     normalize_list_item,
+    parse_coords,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "boss_list_raw.json"
@@ -80,3 +83,51 @@ def test_fixture_round_trip():
     assert all(i["job_id"] for i in items)
     assert all(i["title"] for i in items)
     assert len({i["job_id"] for i in items}) == len(items)
+
+
+# --- 地点：市·区·商圈 ---
+#
+# 这三段是**抓详情页之前**唯一能拿到的地理信息。以前 normalize_list_item
+# 只留第一段就把后两段扔了，等于把「按区域筛掉一半再决定抓谁」的能力也扔了。
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("杭州·滨江区·长河", ("杭州", "滨江区", "长河")),
+        ("杭州·西湖区", ("杭州", "西湖区", "")),
+        ("杭州", ("杭州", "", "")),
+        ("  杭州·余杭区·仓前  ", ("杭州", "余杭区", "仓前")),
+        ("", ("", "", "")),
+        ("杭州··长河", ("杭州", "长河", "")),  # 空段跳过，不产生空区县
+    ],
+)
+def test_location_is_split_into_city_district_and_area(raw, expected):
+    item = normalize_list_item(
+        {"url": "/job_detail/abc123~.html", "title": "后端", "city": raw}
+    )
+    assert (item["city"], item["district"], item["business_area"]) == expected
+
+
+# --- 详情页坐标 ---
+#
+# Boss 的属性叫 data-lat，里面其实是「经度,纬度」，且是 GCJ-02（页面用高德）。
+
+
+def test_parse_coords_reads_longitude_first():
+    assert parse_coords("120.008921,30.282488") == (120.008921, 30.282488)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None, "", "120.008921", "120.008921,30.282488,5",
+        "abc,def", "120.008921,",
+        "8.5,47.3",      # 苏黎世：解析得出来，但不在中国范围内
+        "30.28,120.00",  # 经纬度写反了——落在范围外，必须拒掉
+    ],
+)
+def test_parse_coords_refuses_anything_it_cannot_trust(raw):
+    """距离宁可不显示，也不能显示一个错的。返回 None 而不是 (0,0) 或猜一个：
+    后两种会被下游当成真实坐标，算出一堆看起来精确的假距离。"""
+    assert parse_coords(raw) is None

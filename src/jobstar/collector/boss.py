@@ -12,7 +12,12 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-from jobstar.collector.parse import dedup, extract_job_id, normalize_list_item
+from jobstar.collector.parse import (
+    dedup,
+    extract_job_id,
+    normalize_list_item,
+    parse_coords,
+)
 
 BASE = "https://www.zhipin.com"
 
@@ -54,6 +59,14 @@ SELECTORS: dict[str, str] = {
     "detail_company": ".company-info",
     "detail_hr": ".job-boss-info .name",
     "detail_salary": ".company-info .badge",
+    # 工作地址与坐标。2026-09-16 在真实详情页上核对过：
+    #   .location-address       -> "杭州余杭区乐富海邦园12座201"（纯地址，不含
+    #                              "点击查看地图"，同页的 .job-location 会带上）
+    #   .job-location-map[data-lat] -> data-lat="120.008921,30.282488"
+    # 注意 data-lat 这个名字是 Boss 起的，里面其实是**经度在前、纬度在后**，
+    # 且是 GCJ-02（高德坐标系，页面上用的就是 amap）。
+    "detail_address": ".location-address",
+    "detail_coords": ".job-location-map[data-lat]",
     "chat_input": "#chat-input, textarea.input-area, div[contenteditable=true]",  # UNVERIFIED
     "chat_send": ".btn-send, button[type=submit]",  # UNVERIFIED
     "chat_outgoing_bubble": ".chat-message.self:last-child, .message-item.mine:last-child",  # UNVERIFIED
@@ -164,11 +177,15 @@ def _detail_extract_js() -> str:
         f"const co = document.querySelector({SELECTORS['detail_company']!r});"
         f"const hr = document.querySelector({SELECTORS['detail_hr']!r});"
         f"const sal = document.querySelector({SELECTORS['detail_salary']!r});"
+        f"const addr = document.querySelector({SELECTORS['detail_address']!r});"
+        f"const map = document.querySelector({SELECTORS['detail_coords']!r});"
         "return JSON.stringify({"
         "  raw_jd: jd ? jd.innerText : '',"
         "  company_info: co ? co.innerText : '',"
         "  hr_name: hr ? hr.innerText : '',"
         "  salary_raw: sal ? sal.innerText : '',"
+        "  address: addr ? addr.innerText : '',"
+        "  coords: map ? (map.getAttribute('data-lat') || '') : '',"
         "  body_snippet: document.body.innerText.slice(0, 2000),"
         "});"
     )
@@ -304,14 +321,16 @@ def save_jobs(conn: sqlite3.Connection, items: list[dict]) -> int:
     for item in items:
         cursor = conn.execute(
             "INSERT INTO jobs (platform, job_id, title, company, raw_jd, city, "
-            " salary_raw, hr_name, url) "
-            "VALUES ('boss', ?, ?, ?, '', ?, ?, ?, ?) "
+            " district, business_area, salary_raw, hr_name, url) "
+            "VALUES ('boss', ?, ?, ?, '', ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(platform, job_id) DO NOTHING",
             (
                 item["job_id"],
                 item["title"],
                 item["company"],
                 item["city"],
+                item.get("district", ""),
+                item.get("business_area", ""),
                 item["salary_raw"],
                 item["hr_name"],
                 item["url"],
@@ -328,12 +347,25 @@ def save_detail(conn: sqlite3.Connection, job_id: str, detail: dict) -> None:
     避免用空字符串冲掉列表页阶段已经落库的值。"""
     hr_name = detail.get("hr_name") or ""
     salary_raw = detail.get("salary_raw") or ""
+    address = (detail.get("address") or "").strip()
+    coords = parse_coords(detail.get("coords"))
+    lng, lat = coords if coords else (None, None)
     conn.execute(
         "UPDATE jobs SET raw_jd = ?, detail_fetched = 1, "
         "hr_name = CASE WHEN ? <> '' THEN ? ELSE hr_name END, "
-        "salary_raw = CASE WHEN ? <> '' THEN ? ELSE salary_raw END "
+        "salary_raw = CASE WHEN ? <> '' THEN ? ELSE salary_raw END, "
+        # 地址和坐标同理：抓不到时保留旧值，不用空值把已有的冲掉
+        "address = CASE WHEN ? <> '' THEN ? ELSE address END, "
+        "lng = COALESCE(?, lng), lat = COALESCE(?, lat) "
         "WHERE job_id = ? AND platform = 'boss'",
-        (detail.get("raw_jd", ""), hr_name, hr_name, salary_raw, salary_raw, job_id),
+        (
+            detail.get("raw_jd", ""),
+            hr_name, hr_name,
+            salary_raw, salary_raw,
+            address, address,
+            lng, lat,
+            job_id,
+        ),
     )
     conn.commit()
 

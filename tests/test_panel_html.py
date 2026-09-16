@@ -418,3 +418,33 @@ def test_the_candidate_list_marks_pre_gated_jobs_but_still_lets_you_pick_them():
     assert "预门禁刷掉" in draw, "没有标出被刷掉的岗位"
     assert "reject_reason" in draw, "没有显示被刷掉的原因"
     assert 'out ? "" : "checked"' in draw, "被刷掉的应当默认不勾选、但仍可勾"
+
+
+def test_the_candidate_list_can_be_filtered_by_district():
+    """区县是抓详情页之前唯一能拿到的地理信息——按它筛选是唯一能在花掉
+    页面请求之前用上的地理筛选。"""
+    draw = HTML[HTML.index("function drawDistrictChips()") :]
+    draw = draw[: draw.index("\nconst candidateBoxes")]
+    assert "data-district" in draw, "没有可点的区域筛选片"
+    assert "districtFilter" in draw
+    assert "counts.size <= 1" in draw, "只有一个区时不该占地方"
+
+
+def test_distance_is_hidden_rather_than_faked_when_unknown():
+    """distance_km 为 null 有两种情况：没设家的位置，或这条岗位没抓到坐标。
+    两种都必须不显示——显示 0 是撒谎，显示「未知」只是占地方。"""
+    idx = HTML.index("const distanceHtml")
+    block = HTML[idx : idx + 320]
+    assert "=== null" in block and 'undefined' in block
+    assert '""' in block, "算不出来时应当返回空串"
+
+
+def test_the_settings_page_explains_the_coordinate_system_trap():
+    """岗位坐标取自 Boss 详情页（高德 GCJ-02）。用手机 GPS 或 Google 地图的
+    坐标当家的位置，每个距离都会偏几百米，而且偏得看起来很合理。"""
+    view = HTML[HTML.index("async function renderSettings()") :]
+    view = view[: view.index("\n/* ==================== 路由")]
+    assert 'id="home-loc"' in view, "没有家的位置输入框"
+    assert "高德" in view
+    assert "lbs.amap.com" in view, "没有给出拾取坐标的地方"
+    assert "WGS-84" in view or "GPS" in view, "没有说清坐标系混用的坑"

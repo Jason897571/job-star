@@ -1,7 +1,7 @@
 import pytest
 
 from jobstar.config import SETTING_DEFAULTS
-from jobstar.gate import check, save_result
+from jobstar.gate import check, haversine_km, save_result
 from jobstar.db import get_conn, init_db
 from jobstar.models import JobRequirements
 
@@ -94,3 +94,60 @@ def test_save_result_persists_and_is_idempotent(tmp_path):
     row = conn.execute("SELECT * FROM gate_results WHERE job_id='j1'").fetchone()
     assert row["passed"] == 0
     assert "城市" in row["reject_reason"]
+
+
+# --- 区域与距离 ---
+#
+# 两者生效的时机完全不同，这是整块功能的关键约束：
+#   区县来自列表页 → **抓详情页之前**就知道 → 按它筛选能省下页面请求；
+#   坐标来自详情页 → 只能在第二遍门禁里用 → 省的是打分 token，省不了请求。
+
+
+def _req(city="杭州"):
+    return JobRequirements(
+        "j1", city, None, None, None, None, None, (), None, None, None
+    )
+
+
+def test_district_whitelist_filters_before_any_detail_request():
+    rules = {"district_whitelist": ["滨江区", "西湖区"]}
+    assert check(_req(), rules, district="滨江区").passed
+    result = check(_req(), rules, district="余杭区")
+    assert not result.passed
+    assert "余杭区" in result.reject_reason
+
+
+def test_district_blacklist_only_kills_exact_matches():
+    rules = {"district_blacklist": ["余杭区"]}
+    assert not check(_req(), rules, district="余杭区").passed
+    assert check(_req(), rules, district="滨江区").passed
+
+
+def test_unknown_district_is_let_through():
+    """有的岗位只给到市（`杭州`，没有区段）。门禁的既定原则是字段缺失一律
+    放过，交给打分器看原文——按区县把这类岗位全刷掉是过严的。"""
+    rules = {"district_whitelist": ["滨江区"]}
+    assert check(_req(), rules, district="").passed
+    assert check(_req(), rules, district=None).passed
+
+
+def test_commute_limit_rejects_jobs_that_are_too_far():
+    rules = {"max_commute_km": 15}
+    assert check(_req(), rules, distance_km=8.2).passed
+    result = check(_req(), rules, distance_km=31.7)
+    assert not result.passed
+    assert "31.7" in result.reject_reason and "15" in result.reject_reason
+
+
+def test_commute_limit_does_nothing_when_distance_is_unknown():
+    """没设家的位置、或这条岗位没抓到坐标时 distance 是 None。这时必须放过——
+    把「不知道多远」当成「太远」会悄悄刷掉一大批岗位。"""
+    rules = {"max_commute_km": 5}
+    assert check(_req(), rules, distance_km=None).passed
+
+
+def test_haversine_matches_a_known_distance():
+    """杭州东站 (120.213,30.291) → 滨江区长河 (120.212,30.206)，约 9.4 公里。"""
+    d = haversine_km((120.213, 30.291), (120.212, 30.206))
+    assert 9.0 < d < 10.0, d
+    assert haversine_km((120.2, 30.2), (120.2, 30.2)) == 0

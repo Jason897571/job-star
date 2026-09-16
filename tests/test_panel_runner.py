@@ -496,3 +496,87 @@ def test_list_run_never_opens_a_detail_page(client, monkeypatch):
 def test_list_and_detail_endpoints_require_the_panel_header(client):
     assert client.post("/api/run/list", json={"keywords": ["x"], "city": "1"}).status_code == 403
     assert client.post("/api/run/detail", json={"job_ids": ["j1"]}).status_code == 403
+
+
+# --- 区域与距离在面板上的出口 ---
+
+
+def test_candidates_expose_the_district_so_the_panel_can_filter_by_it(client):
+    """区县是抓详情页之前唯一能拿到的地理信息。候选列表不返回它，面板就
+    没法在花掉页面请求之前按区域筛。"""
+    client.conn.execute(
+        "INSERT INTO jobs (platform, job_id, title, company, city, district, "
+        " business_area, url) VALUES ('boss','j1','后端','A','杭州','滨江区','长河','https://x/j1')"
+    )
+    client.conn.execute("INSERT INTO gate_results (job_id, passed) VALUES ('j1', 1)")
+    client.conn.commit()
+
+    (item,) = client.get("/api/candidates").json()["items"]
+    assert item["district"] == "滨江区"
+    assert item["business_area"] == "长河"
+
+
+def test_queue_reports_distance_from_home_when_both_ends_have_coordinates(client):
+    from jobstar.actions import enqueue
+    from jobstar.config import set_setting
+
+    set_setting(client.conn, "home_location", "120.213,30.291")   # 杭州东站附近
+    client.conn.execute(
+        "INSERT INTO jobs (platform, job_id, title, company, city, district, "
+        " address, lng, lat, url) VALUES "
+        "('boss','j1','后端','A','杭州','滨江区','杭州滨江区长河',120.212,30.206,'https://x/j1')"
+    )
+    client.conn.commit()
+    enqueue(client.conn, type="send_greeting", job_id="j1", payload={"greeting": "你好"})
+
+    (item,) = client.get("/api/queue").json()["items"]
+    assert item["district"] == "滨江区"
+    assert item["address"] == "杭州滨江区长河"
+    assert 9.0 < item["distance_km"] < 10.0
+
+
+@pytest.mark.parametrize(
+    "home,lng,lat",
+    [
+        (None, 120.212, 30.206),   # 没设家的位置
+        ("120.213,30.291", None, None),  # 这条岗位没抓到坐标（老数据）
+    ],
+)
+def test_distance_is_null_rather_than_zero_when_it_cannot_be_computed(
+    client, home, lng, lat
+):
+    """显示 0 公里是撒谎，显示「未知」只是占地方。返回 null，前端整个不显示。"""
+    from jobstar.actions import enqueue
+    from jobstar.config import set_setting
+
+    set_setting(client.conn, "home_location", home)
+    client.conn.execute(
+        "INSERT INTO jobs (platform, job_id, title, company, city, lng, lat, url) "
+        "VALUES ('boss','j1','后端','A','杭州',?,?,'https://x/j1')",
+        (lng, lat),
+    )
+    client.conn.commit()
+    enqueue(client.conn, type="send_greeting", job_id="j1", payload={"greeting": "你好"})
+
+    (item,) = client.get("/api/queue").json()["items"]
+    assert item["distance_km"] is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["120.21", "abc,def", "8.5,47.3", "30.28,120.00", ""],
+)
+def test_a_home_location_that_cannot_be_trusted_is_rejected_on_write(client, value):
+    """写坏的坐标会让每一条距离都错，而且错得看起来很精确。挡在写入的时刻。"""
+    resp = client.put(
+        "/api/settings", json={"home_location": value}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 400
+    assert "经度,纬度" in resp.json()["detail"]
+
+
+def test_clearing_the_home_location_is_allowed(client):
+    """「我不想用这个功能」不是填错了。"""
+    assert client.put(
+        "/api/settings", json={"home_location": None}, headers=PANEL_HEADERS
+    ).status_code == 200

@@ -196,6 +196,11 @@
   }
   .tag button:hover { opacity: 1; }
 
+  .tag.chip { cursor: pointer; background: var(--surface-2); color: var(--muted); padding: 4px 11px; }
+  .tag.chip:hover { color: var(--text); }
+  .tag.chip.on { background: var(--accent); color: #fff; }
+  .tag.chip b { font-weight: 700; }
+
   /* ---- 候选列表 ---- */
   .cand {
     display: flex; align-items: center; gap: 10px;
@@ -424,6 +429,16 @@ function _sendingCard(row, noteHtml) {
       </div>`;
 }
 
+// 区域优先于市：同在杭州，滨江和余杭是完全不同的两件事
+const placeHtml = (i) =>
+  [i.district, i.business_area].filter(Boolean).map(esc).join("·") || esc(i.city);
+
+// distance_km 为 null 有两种情况：没设家的位置，或这条岗位没抓到坐标。
+// 两种都不显示——显示「未知」只是占地方，显示 0 是撒谎。
+const distanceHtml = (i) =>
+  i.distance_km === null || i.distance_km === undefined
+    ? "" : ` · <b>距家 ${esc(i.distance_km)} 公里</b>`;
+
 async function renderQueue() {
   const { items, uncertain, interrupted } = await api("/api/queue");
   let html = `<h2>待确认队列</h2>
@@ -445,7 +460,7 @@ async function renderQueue() {
         <div class="card-head">
           <div class="title">
             <b>${esc(i.title)}</b> · ${esc(i.company)}
-            <div class="meta">${esc(i.city)} · ${esc(i.salary_raw)} ·
+            <div class="meta">${placeHtml(i)} · ${esc(i.salary_raw)}${distanceHtml(i)} ·
               <a href="${safeHref(i.url)}" target="_blank" rel="noopener">原页面</a> ·
               <a href="#" data-detail="${esc(i.job_id)}">分数拆解</a></div>
           </div>
@@ -506,6 +521,7 @@ async function renderCollect() {
         </div>
         <span id="cand-count" class="meta"></span>
       </div>
+      <div class="tags" id="cand-districts"></div>
       <div id="cand-list"></div>
       <div class="row">
         <button class="btn" id="cand-all">全选</button>
@@ -618,10 +634,19 @@ function drawTags() {
 
 /* ---- 候选列表：拉到列表页、还没抓详情的岗位 ---- */
 
+// 区域筛选：null = 全部，否则只显示这个区。区县来自列表页，**抓详情页之前
+// 就知道**，所以按它筛选能直接减少要打开的页面数——这是这一整块的意义。
+let districtFilter = null;
+let allCandidates = [];
+
 async function drawCandidates() {
   const box = $("#cand-list");
   if (!box) return;
-  const { items } = await api("/api/candidates");
+  allCandidates = (await api("/api/candidates")).items;
+  drawDistrictChips();
+  const items = districtFilter === null
+    ? allCandidates
+    : allCandidates.filter(i => (i.district || "未标注") === districtFilter);
 
   const passed = items.filter(i => i.passed !== false).length;
   $("#cand-hint").innerHTML = items.length
@@ -641,18 +666,47 @@ async function drawCandidates() {
     const out = i.passed === false;
     // 薪资多半是空的（列表页反爬字体），空的时候连分隔点都不要
     const salaryHtml = i.salary_raw ? ` · ${esc(i.salary_raw)}` : "";
+    const placeHtml = [i.district, i.business_area].filter(Boolean).map(esc).join("·")
+      || esc(i.city);
     return `
     <label class="cand${out ? " out" : ""}">
       <input type="checkbox" data-cand="${esc(i.job_id)}" ${out ? "" : "checked"}>
       <span class="cand-main">
         <span class="cand-title"><b>${esc(i.title)}</b><span class="meta">· ${esc(i.company)}</span></span>
-        <span class="meta">${esc(i.city)}${salaryHtml}
+        <span class="meta">${placeHtml}${salaryHtml}
           · <a href="${safeHref(i.url)}" target="_blank" rel="noopener">原页面</a></span>
       </span>
       ${out ? `<span class="badge gap">预门禁刷掉：${esc(i.reject_reason)}</span>` : ""}
     </label>`;
   }).join("");
   updateSelectionCount();
+}
+
+/* 按区县聚合成一排可点的筛选片。只列出这一批候选里真实出现过的区县——
+   凭空列出全市所有区，人得在一堆「0 条」里找自己要的那个。 */
+function drawDistrictChips() {
+  const box = $("#cand-districts");
+  if (!box) return;
+  const counts = new Map();
+  for (const i of allCandidates) {
+    const d = i.district || "未标注";
+    counts.set(d, (counts.get(d) || 0) + 1);
+  }
+  if (counts.size <= 1) { box.innerHTML = ""; return; }   // 只有一个区就别占地方
+
+  const chips = [[null, "全部", allCandidates.length]];
+  for (const [d, n] of [...counts].sort((a, b) => b[1] - a[1])) chips.push([d, d, n]);
+  box.innerHTML = chips.map(([value, label, n]) => {
+    const on = districtFilter === value;
+    return `<span class="tag chip${on ? " on" : ""}" data-district="${esc(value ?? "")}"
+      >${esc(label)} <b>${esc(n)}</b></span>`;
+  }).join("");
+  box.onclick = (e) => {
+    const chip = e.target.closest("[data-district]");
+    if (!chip) return;
+    districtFilter = chip.dataset.district || null;
+    drawCandidates();
+  };
 }
 
 const candidateBoxes = () => document.querySelectorAll("[data-cand]");
@@ -939,13 +993,33 @@ async function renderThreshold() {
 // 这几项由程序写入（采集健康状态、上次搜索条件），不该混在人工编辑区里
 // 让人误以为是可调的旋钮。
 const MACHINE_KEYS = ["last_collect_error", "last_collect_at", "last_collect_ok_at", "last_search"];
+// 这些有专门的输入框，不进下面那个「按 JSON 解析」的通用列表——让人给一个
+// 坐标加引号写成 JSON 是没必要的刁难。
+const DEDICATED_KEYS = ["home_location"];
 
 async function renderSettings() {
   const s = await api("/api/settings");
-  const editable = Object.entries(s).filter(([k]) => !MACHINE_KEYS.includes(k));
+  const editable = Object.entries(s)
+    .filter(([k]) => !MACHINE_KEYS.includes(k) && !DEDICATED_KEYS.includes(k));
   $("#main").innerHTML = `
     <h2>设置</h2>
     <p class="lede">值按 JSON 解析。<code>score_threshold</code> 填 <code>null</code> 表示冷启动期，一条动作都不生成。</p>
+
+    <div class="card">
+      <h3 style="margin-top:0">家的位置</h3>
+      <label class="field"><span>经度,纬度</span>
+        <input id="home-loc" value="${esc(s.home_location || "")}" placeholder="例如 120.21,30.25"></label>
+      <div class="meta">留空 = 不显示距离。到
+        <a href="https://lbs.amap.com/tools/picker" target="_blank" rel="noopener">高德坐标拾取器</a>
+        搜你家地址，复制那一串「经度,纬度」原样贴进来。<br>
+        <b>必须用高德</b>：岗位坐标直接取自 Boss 详情页，而那个页面用的就是高德坐标系；
+        混用手机 GPS 或 Google 地图的坐标，每个距离都会偏几百米。<br>
+        设好之后，待确认队列里每条会显示「距家 N 公里」；想按距离硬性过滤，
+        到下面 <code>gate_rules</code> 里设 <code>max_commute_km</code>。
+        注意那一条只能在抓完详情页之后生效（坐标那时才有），省的是打分的 token，
+        省不了页面请求——想省请求请用「采集与打分」页的区域筛选。</div>
+    </div>
+
     <div class="card">` +
     editable.map(([k, v]) =>
       `<label class="field"><span>${esc(k)}</span><input data-key="${esc(k)}" value='${esc(JSON.stringify(v))}'></label>`
@@ -965,6 +1039,9 @@ async function renderSettings() {
       try { body[el.dataset.key] = JSON.parse(el.value); }
       catch { return showError(`${el.dataset.key} 不是合法 JSON`); }
     }
+    // 空串 = 没设，要存 null 而不是 ""——""` 会通不过后端的坐标校验，
+    // 而「我不想用这个功能」不该被当成填错了。
+    body.home_location = $("#home-loc").value.trim() || null;
     // Important 6：Task 12 加了 validate_setting_value 专门让坏设置在写入
     // 时就 400——但改之前这里没有 try/catch，PUT 被 api() reject 之后这个
     // async 函数直接整体失败，既不报错也不提示"已保存"，用户合理地以为

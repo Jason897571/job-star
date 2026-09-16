@@ -137,6 +137,32 @@ def prelim_requirements(
     )
 
 
+def home_coords(conn: sqlite3.Connection) -> tuple[float, float] | None:
+    """家的坐标 (经度, 纬度)，没设或设坏了都返回 None。
+
+    没设不是错误：距离是可选功能，不设就整个不显示，而不是拿一个猜的
+    坐标算出一堆看起来精确的假距离。
+    """
+    from jobstar.collector.parse import parse_coords
+
+    raw = get_setting(conn, "home_location")
+    return parse_coords(raw) if raw else None
+
+
+def job_distance_km(row: sqlite3.Row, home: tuple[float, float] | None) -> float | None:
+    """岗位到家的直线距离。缺任何一端的坐标都返回 None（不是 0，也不是很大
+    的数——那两种都会被下游当成真实距离用）。"""
+    if home is None:
+        return None
+    try:
+        lng, lat = row["lng"], row["lat"]
+    except (IndexError, KeyError):
+        return None
+    if lng is None or lat is None:
+        return None
+    return gate.haversine_km(home, (lng, lat))
+
+
 def _gate_rules(conn: sqlite3.Connection) -> dict:
     """拼装门禁规则：settings 里的 gate_rules 加上 my_degree（硬性学历项存在
     单独的配置键里，不属于 gate_rules 本身，但门禁判断时要和其余规则一起传入）。"""
@@ -193,7 +219,9 @@ def run_list(
             continue
 
         req = prelim_requirements(row, item.get("tags"))
-        result = gate.check(req, rules, company=row["company"] or "")
+        result = gate.check(
+            req, rules, company=row["company"] or "", district=row["district"]
+        )
         gate.save_result(conn, row["job_id"], result)
         if result.passed:
             report.candidates += 1
@@ -562,6 +590,7 @@ def run_score(
     cards = load_cards(get_settings().cards_path)
     weights = get_setting(conn, "dimension_weights")
     rules = _gate_rules(conn)
+    home = home_coords(conn)
 
     for index, row in enumerate(rows):
         if stop():
@@ -586,7 +615,13 @@ def run_score(
             continue
         save_requirements(conn, req)
 
-        gate_result = gate.check(req, rules, company=row["company"] or "")
+        gate_result = gate.check(
+            req,
+            rules,
+            company=row["company"] or "",
+            district=row["district"],
+            distance_km=job_distance_km(row, home),
+        )
         gate.save_result(conn, row["job_id"], gate_result)
         if not gate_result.passed:
             note(f"门禁刷掉：{row['title']}（{gate_result.reject_reason}）")

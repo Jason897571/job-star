@@ -16,6 +16,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     company         TEXT NOT NULL,
     raw_jd          TEXT NOT NULL DEFAULT '',
     city            TEXT,
+    district        TEXT,          -- 列表页就能拿到：滨江区
+    business_area   TEXT,          -- 列表页就能拿到：长河
+    address         TEXT,          -- 详情页才有：杭州余杭区乐富海邦园12座201
+    lng             REAL,          -- 详情页才有，GCJ-02（高德坐标系）
+    lat             REAL,
     salary_raw      TEXT,
     hr_name         TEXT,
     url             TEXT,
@@ -113,6 +118,31 @@ def get_conn(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+# 后加的列。SCHEMA 里的 CREATE TABLE IF NOT EXISTS 对**已经存在**的表什么都
+# 不做，所以新列必须单独补——否则老库升级上来会在第一次查询时炸。
+# (表, 列, 类型)，顺序即添加顺序。
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("jobs", "district", "TEXT"),
+    ("jobs", "business_area", "TEXT"),
+    ("jobs", "address", "TEXT"),
+    ("jobs", "lng", "REAL"),
+    ("jobs", "lat", "REAL"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """给既有库补上后加的列。已经有的跳过，所以可以反复调用。
+
+    用 PRAGMA 查实际列名而不是 try/except ALTER：后者在别的原因失败时会被
+    一起吞掉，而这里失败意味着库结构和代码对不上，必须炸出来。
+    """
+    for table, column, decl in _ADDED_COLUMNS:
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _add_missing_columns(conn)
     conn.commit()

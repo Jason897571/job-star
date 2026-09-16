@@ -27,6 +27,13 @@ SETTING_DEFAULTS: dict[str, Any] = {
         "years_min": 0,
         "years_max": 10,
         "company_blacklist": [],
+        # 区域筛选。列表页就给了「市·区·商圈」，所以这一条**在抓详情页之前**
+        # 就能生效，是真正能省下页面请求的那个旋钮。留空 = 不限。
+        "district_whitelist": [],
+        "district_blacklist": [],
+        # 通勤距离上限（公里）。坐标要抓了详情页才有，所以这条只能在第二遍
+        # 门禁里生效——省的是打分的 token，省不了页面请求。null = 不限。
+        "max_commute_km": None,
     },
     "dimension_weights": {
         "skills": 0.35,
@@ -43,6 +50,10 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "last_collect_error": None,
     "last_collect_at": None,
     "last_collect_ok_at": None,
+    # 家的位置，"经度,纬度"，GCJ-02（高德）坐标系。null = 没设，距离相关的
+    # 功能整个不显示。为什么必须是高德：岗位坐标直接取自 Boss 详情页，而那个
+    # 页面用的就是高德；混用 GPS 原始坐标（WGS-84）会让每个距离都偏几百米。
+    "home_location": None,
     # 面板「采集」页上次用的搜索条件，纯粹为了下次打开时预填表单。
     # 城市码是 Boss 的 city code（杭州 101210100）。
     "last_search": {"keywords": [], "city": "101210100", "pages": 1},
@@ -154,6 +165,12 @@ def validate_setting_value(key: str, value: Any) -> None:
                 raise ValueError(f"{key}.{sub} 必须是数字或 null")
         if "degree_hard" in value and not isinstance(value["degree_hard"], bool):
             raise ValueError(f"{key}.degree_hard 必须是布尔值")
+        for sub in ("district_whitelist", "district_blacklist"):
+            if sub in value and not _is_str_list(value[sub]):
+                raise ValueError(f"{key}.{sub} 必须是字符串列表")
+        if "max_commute_km" in value and value["max_commute_km"] is not None:
+            if not _is_number(value["max_commute_km"]) or value["max_commute_km"] <= 0:
+                raise ValueError(f"{key}.max_commute_km 必须是正数或 null")
         # 未知子键（例如 my_degree）允许——它们在别处（pipeline._gate_rules）
         # 被合并进这份规则，不属于 gate_rules 自身的 schema。
 
@@ -174,6 +191,16 @@ def validate_setting_value(key: str, value: Any) -> None:
     elif key in ("last_collect_error", "last_collect_at", "last_collect_ok_at"):
         if value is not None and not isinstance(value, str):
             raise ValueError(f"{key} 必须是字符串或 null")
+
+    elif key == "home_location":
+        if value is not None:
+            from jobstar.collector.parse import parse_coords
+
+            if parse_coords(value) is None:
+                raise ValueError(
+                    f"{key} 必须是「经度,纬度」且落在中国范围内（例如 120.21,30.25），"
+                    f"实际是 {value!r}。到高德拾取坐标：https://lbs.amap.com/tools/picker"
+                )
 
     elif key == "last_search":
         if not isinstance(value, dict):

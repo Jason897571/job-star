@@ -200,8 +200,12 @@ def clear_collect_error(conn: sqlite3.Connection = Depends(get_db)) -> dict:
 
 @app.get("/api/queue")
 def queue(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    from jobstar.pipeline import home_coords, job_distance_km
+
+    home = home_coords(conn)
     rows = conn.execute(
         "SELECT a.id, a.job_id, a.payload, j.title, j.company, j.city, "
+        "       j.district, j.business_area, j.address, j.lng, j.lat, "
         "       j.salary_raw, j.url, s.total "
         "FROM actions a "
         "JOIN jobs j ON j.job_id = a.job_id "
@@ -212,6 +216,7 @@ def queue(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     items = []
     for row in rows:
         payload = json.loads(row["payload"])
+        distance = job_distance_km(row, home)
         items.append(
             {
                 "action_id": row["id"],
@@ -219,6 +224,12 @@ def queue(conn: sqlite3.Connection = Depends(get_db)) -> dict:
                 "title": row["title"],
                 "company": row["company"],
                 "city": row["city"],
+                "district": row["district"] or "",
+                "business_area": row["business_area"] or "",
+                "address": row["address"] or "",
+                # 没设家的位置、或者这条岗位没抓到坐标时是 null——前端据此
+                # 整个不显示距离，而不是显示一个 0 或者「未知公里」
+                "distance_km": None if distance is None else round(distance, 1),
                 "salary_raw": row["salary_raw"],
                 "url": row["url"],
                 "total": row["total"],
@@ -648,11 +659,11 @@ def candidates(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     藏起来——藏起来人会以为是系统丢了字段。
     """
     rows = conn.execute(
-        "SELECT j.job_id, j.title, j.company, j.city, j.salary_raw, j.url, "
-        "       j.collected_at, g.passed, g.reject_reason "
+        "SELECT j.job_id, j.title, j.company, j.city, j.district, j.business_area, "
+        "       j.salary_raw, j.url, j.collected_at, g.passed, g.reject_reason "
         "FROM jobs j LEFT JOIN gate_results g ON g.job_id = j.job_id "
         "WHERE j.detail_fetched = 0 "
-        "ORDER BY j.collected_at DESC, j.id"
+        "ORDER BY j.district, j.collected_at DESC, j.id"
     ).fetchall()
     return {
         "items": [
@@ -661,6 +672,10 @@ def candidates(conn: sqlite3.Connection = Depends(get_db)) -> dict:
                 "title": r["title"],
                 "company": r["company"],
                 "city": r["city"],
+                # 区县和商圈来自列表页，**抓详情页之前就有**——面板靠它做
+                # 区域筛选，这是唯一能在花掉页面请求之前用上的地理信息。
+                "district": r["district"] or "",
+                "business_area": r["business_area"] or "",
                 "salary_raw": r["salary_raw"],
                 "url": r["url"],
                 "collected_at": r["collected_at"],

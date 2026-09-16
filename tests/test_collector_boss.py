@@ -253,3 +253,71 @@ def test_fetch_detail_empty_jd_raises_collect_error_and_dumps_failure(monkeypatc
     dumped = list((tmp_path / "collector_failures").glob("detail-j1-empty-jd.txt"))
     assert len(dumped) == 1
     assert str(dumped[0]) in message
+
+
+# --- 地点与坐标的落库 ---
+
+
+def test_save_jobs_keeps_district_and_business_area(tmp_path):
+    conn = get_conn(tmp_path / "t.db")
+    init_db(conn)
+    """区县是抓详情页之前唯一能拿到的地理信息，必须一路存到库里，
+    否则候选列表就没法按区域筛。"""
+    boss.save_jobs(
+        conn,
+        [
+            {
+                "job_id": "j1", "title": "后端", "company": "A",
+                "city": "杭州", "district": "滨江区", "business_area": "长河",
+                "salary_raw": "-K·薪", "hr_name": "", "url": "https://x/j1",
+            }
+        ],
+    )
+    row = conn.execute("SELECT * FROM jobs WHERE job_id='j1'").fetchone()
+    assert (row["city"], row["district"], row["business_area"]) == ("杭州", "滨江区", "长河")
+
+
+def test_save_detail_stores_address_and_coordinates(tmp_path):
+    conn = get_conn(tmp_path / "t.db")
+    init_db(conn)
+    boss.save_jobs(
+        conn,
+        [{"job_id": "j1", "title": "后端", "company": "A", "city": "杭州",
+          "salary_raw": "", "hr_name": "", "url": "https://x/j1"}],
+    )
+    boss.save_detail(
+        conn, "j1",
+        {"raw_jd": "JD 全文", "address": "杭州余杭区乐富海邦园12座201",
+         "coords": "120.008921,30.282488"},
+    )
+    row = conn.execute("SELECT * FROM jobs WHERE job_id='j1'").fetchone()
+    assert row["address"] == "杭州余杭区乐富海邦园12座201"
+    assert (row["lng"], row["lat"]) == (120.008921, 30.282488)
+
+
+def test_save_detail_does_not_wipe_good_coordinates_with_a_bad_reread(tmp_path):
+    """和 hr_name/salary_raw 同样的道理：抓不到就保留旧值，不要用空值把
+    已经拿到的坐标冲掉——那会让一条本来能算距离的岗位悄悄失去距离。"""
+    conn = get_conn(tmp_path / "t.db")
+    init_db(conn)
+    boss.save_jobs(
+        conn,
+        [{"job_id": "j1", "title": "后端", "company": "A", "city": "杭州",
+          "salary_raw": "", "hr_name": "", "url": "https://x/j1"}],
+    )
+    boss.save_detail(conn, "j1", {"raw_jd": "JD", "address": "好地址",
+                                  "coords": "120.008921,30.282488"})
+    boss.save_detail(conn, "j1", {"raw_jd": "JD", "address": "", "coords": ""})
+    row = conn.execute("SELECT * FROM jobs WHERE job_id='j1'").fetchone()
+    assert row["address"] == "好地址"
+    assert row["lng"] == 120.008921
+
+
+def test_detail_extract_js_asks_for_address_and_coords():
+    """选择器是 2026-09-16 在真实详情页上核对过的。抽取脚本里必须真的用上
+    它们，否则库里永远是空坐标，而距离功能会静默地整个不工作。"""
+    js = boss._detail_extract_js()
+    assert boss.SELECTORS["detail_address"] in js
+    assert boss.SELECTORS["detail_coords"] in js
+    assert "data-lat" in js, "坐标在 data-lat 属性里，不是 innerText"
+    assert "address:" in js and "coords:" in js
