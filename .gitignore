@@ -219,6 +219,9 @@ __marimo__/
 .DS_Store
 
 # jobstar
-data/*.db
-data/fixtures/live/
 .env
+
+# === 个人隐私：整个 data/ 目录不入 git ===
+# capability_cards.yaml 由简历主库提炼而来，含雇主、项目代号、客户案例，
+# 以及本人对每项能力的诚实自评（「证据强度」列）。只保留在本地。
+data/

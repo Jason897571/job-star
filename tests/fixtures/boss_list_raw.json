@@ -1,0 +1,47 @@
+[
+  {
+    "url": "/job_detail/aaaa1111bbbb2222cccc3333~.html?lid=xyz&securityId=aaa",
+    "title": "  后端开发工程师（示例数据）  ",
+    "company": "示例科技有限公司",
+    "city": " 杭州 ",
+    "salary": "-K·薪",
+    "hr": "",
+    "tags": ["经验不限", "本科"]
+  },
+  {
+    "url": "/job_detail/aaaa1111bbbb2222cccc3333~.html?lid=other&securityId=bbb",
+    "title": "后端开发工程师（示例数据）",
+    "company": "示例科技有限公司",
+    "city": " 杭州 ",
+    "salary": "-K·薪",
+    "hr": "",
+    "tags": ["经验不限", "本科"]
+  },
+  {
+    "url": "/job_detail/dddd4444eeee5555ffff6666~.html",
+    "title": "Java 后端开发工程师（示例数据）",
+    "company": "示例网络技术有限公司",
+    "city": " 杭州·滨江区·长河 ",
+    "salary": "-K·薪",
+    "hr": "",
+    "tags": ["3-5年", "本科"]
+  },
+  {
+    "url": "/job_detail/gggg7777hhhh8888iiii9999~.html",
+    "title": "资深后端开发工程师（示例数据）",
+    "company": "示例创新",
+    "city": " 杭州 ",
+    "salary": "-K",
+    "hr": "",
+    "tags": ["5-10年", "本科"]
+  },
+  {
+    "url": "",
+    "title": "脏数据：没有 url，应被 normalize_list_item 丢弃",
+    "company": "",
+    "city": "",
+    "salary": "",
+    "hr": "",
+    "tags": []
+  }
+]
