@@ -47,6 +47,10 @@ class ScoreReport:
     failed: int = 0
     pitch_failed: int = 0
     enqueued: int = 0
+    # 以下两项只可能在 `--rescore` 重跑里非零（普通一轮里岗位从没打过分，
+    # 也就不可能已经有动作）：
+    already_queued: int = 0  # 队列里已经有这个岗位的动作，本轮没有重新生成话术
+    retracted: int = 0  # 重跑后不再合格，队列里那条旧动作被撤回成「跳过」
     errors: list[str] = field(default_factory=list)
 
 
@@ -176,19 +180,13 @@ def run_collect(
     return report
 
 
-def maybe_enqueue(
-    conn: sqlite3.Connection,
-    req: JobRequirements,
-    result,
-    *,
-    title: str,
-    company: str,
-    cards: tuple[CapabilityCard, ...] | None = None,
-) -> int | None:
-    """总分达到阈值才生成待确认动作。阈值为 None（冷启动期）时永远不生成。
+def threshold_reached(conn: sqlite3.Connection, total: float) -> bool:
+    """总分是否达到入队阈值。阈值为 None（冷启动期）时恒为 False。
 
-    `cards` 让调用方复用已经加载过的卡片库（run_score 每轮只加载一次），不传时
-    退化为自己读一遍——直接调用 maybe_enqueue 的既有测试不用改。
+    抽成独立函数是因为 `run_score` 也要问同一个问题——重跑时分数可能从阈值
+    之上掉到之下，那条已经躺在待确认队列里的旧动作必须被撤回，而不是靠
+    `maybe_enqueue` 返回 None 默默带过（见 `_retract_stale_action`）。两处
+    必须用同一套判断，否则会出现「不入队但也不撤回」的夹缝。
     """
     threshold = get_setting(conn, "score_threshold")
     if threshold is not None and (
@@ -206,7 +204,24 @@ def maybe_enqueue(
             f"score_threshold 配置已损坏（{threshold!r} 既不是数字也不是 "
             "null），拒绝据此决定是否入队；请到面板设置里修正"
         )
-    if threshold is None or result.total < float(threshold):
+    return threshold is not None and total >= float(threshold)
+
+
+def maybe_enqueue(
+    conn: sqlite3.Connection,
+    req: JobRequirements,
+    result,
+    *,
+    title: str,
+    company: str,
+    cards: tuple[CapabilityCard, ...] | None = None,
+) -> int | None:
+    """总分达到阈值才生成待确认动作。阈值为 None（冷启动期）时永远不生成。
+
+    `cards` 让调用方复用已经加载过的卡片库（run_score 每轮只加载一次），不传时
+    退化为自己读一遍——直接调用 maybe_enqueue 的既有测试不用改。
+    """
+    if not threshold_reached(conn, result.total):
         return None
     if cards is None:
         cards = load_cards(get_settings().cards_path)
@@ -294,19 +309,68 @@ def clear_for_rescore(conn: sqlite3.Connection, *, job_id: str | None = None) ->
     return len(ids)
 
 
-def run_score(conn: sqlite3.Connection, *, limit: int | None = None) -> ScoreReport:
-    """对已抓详情、已过第一遍门禁、还没打过分的岗位做归一化 + 门禁 + 打分。"""
+def _existing_action(conn: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
+    """这个岗位在待确认队列里已有的招呼动作（actions 对 (type, job_id) 唯一）。"""
+    return conn.execute(
+        "SELECT id, status FROM actions WHERE type = 'send_greeting' AND job_id = ?",
+        (job_id,),
+    ).fetchone()
+
+
+def _retract_stale_action(conn: sqlite3.Connection, job_id: str, reason: str) -> bool:
+    """重跑后岗位不再合格时，撤回队列里那条按旧结论生成的动作。
+
+    为什么必须撤回而不是放着不管：`clear_for_rescore` 只清 scores/gate_results，
+    动作表原封不动。于是「人工把公司拉黑 → --rescore → 第二遍门禁刷掉它」
+    之后，队列里仍然躺着一条 pending 的招呼，卡片上还是旧话术，面板不显示
+    jobs.status，人工看不出这条已经作废——点一下确认就发给了刚被自己拉黑的
+    公司。分数从阈值之上掉到之下也是同一个夹缝。
+
+    只撤回 pending 和 approved：
+      - pending 还没有人做过决定，撤回不覆盖任何人的判断；
+      - approved 是人工批准过的，但「把公司拉黑 / 调高阈值」同样是人工的
+        决定，而且是更晚的那一个——让后一个决定生效，方向上也只会少发不会
+        多发。撤回成 skipped 之后人工随时能再点确认改回来（状态机允许
+        skipped → approved），不是不可逆的。
+      - sending/sent 不动：消息可能已经或确实已经发出去了，撤回只会让台账
+        和事实不符。
+    撤回原因写进 actions.error，不让它成为一次静默的状态变更。
+    """
+    row = _existing_action(conn, job_id)
+    if row is None or row["status"] not in (actions.PENDING, actions.APPROVED):
+        return False
+    actions.skip(conn, row["id"])
+    conn.execute(
+        "UPDATE actions SET error = ? WHERE id = ?", (reason, row["id"])
+    )
+    conn.commit()
+    return True
+
+
+def run_score(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None = None,
+    job_id: str | None = None,
+) -> ScoreReport:
+    """对已抓详情、已过第一遍门禁、还没打过分的岗位做归一化 + 门禁 + 打分。
+
+    `job_id` 只处理这一个岗位。`clear_for_rescore` 有同名参数，两者必须一起
+    传——只限定清场范围而让打分全库跑，等于对着一堆人工没点名的岗位调 LLM
+    写话术、生成待确认动作，而命令行还在说「只重跑这一个」。
+    """
     report = ScoreReport()
     sql = (
         "SELECT j.* FROM jobs j "
         "JOIN gate_results g ON g.job_id = j.job_id AND g.passed = 1 "
         "LEFT JOIN scores s ON s.job_id = j.job_id "
         "WHERE j.detail_fetched = 1 AND s.job_id IS NULL "
+        "AND (? IS NULL OR j.job_id = ?) "
         "ORDER BY j.collected_at"
     )
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
-    rows = conn.execute(sql).fetchall()
+    rows = conn.execute(sql, (job_id, job_id)).fetchall()
 
     cards = load_cards(get_settings().cards_path)
     weights = get_setting(conn, "dimension_weights")
@@ -336,6 +400,13 @@ def run_score(conn: sqlite3.Connection, *, limit: int | None = None) -> ScoreRep
                 "UPDATE jobs SET status='gated_out' WHERE job_id=?", (row["job_id"],)
             )
             conn.commit()
+            if _retract_stale_action(
+                conn,
+                row["job_id"],
+                f"重跑后被门禁刷掉（{gate_result.reject_reason}），"
+                "这条招呼按的是旧结论，已自动撤回；确认无误可以再点确认恢复",
+            ):
+                report.retracted += 1
             continue
 
         try:
@@ -350,7 +421,26 @@ def run_score(conn: sqlite3.Connection, *, limit: int | None = None) -> ScoreRep
         report.scored += 1
 
         try:
-            if maybe_enqueue(
+            qualifies = threshold_reached(conn, result.total)
+            if not qualifies:
+                # 重跑把分数打到了阈值之下——队列里那条按旧分数生成的招呼
+                # 现在是过期结论，撤回它（普通一轮里到不了这里：没打过分的
+                # 岗位不可能已经有动作）。
+                if _retract_stale_action(
+                    conn,
+                    row["job_id"],
+                    f"重跑后总分 {result.total} 低于阈值，这条招呼按的是旧分数，"
+                    "已自动撤回；确认无误可以再点确认恢复",
+                ):
+                    report.retracted += 1
+            elif _existing_action(conn, row["job_id"]) is not None:
+                # 队列里已经有这个岗位的动作。actions 的 UNIQUE(type, job_id)
+                # 决定了再入队是 DO NOTHING——话术会生成出来然后被原样丢弃，
+                # 白烧一次 LLM 调用；旧 payload 也不会被覆盖（那是对的：台账
+                # 里记的必须是真正发出去的那一版）。所以这里根本不去生成，
+                # 单独计数，而不是混进 enqueued 里谎报「入队 N」。
+                report.already_queued += 1
+            elif maybe_enqueue(
                 conn,
                 req,
                 result,

@@ -160,14 +160,110 @@ def test_every_single_quoted_attribute_in_the_panel_goes_through_esc():
     assert not offenders, "单引号属性里有未经 esc() 的插值：\n" + "\n".join(offenders)
 
 
-def test_failure_banners_name_the_command_that_reopens_the_jobs():
+def _ternary_branch(count_field: str) -> str:
+    """把 `(h.xxx ? ... : "")` 这一整个三元分支的文本取出来。
+
+    用固定字符数开窗是不行的：两条失败横幅紧挨着，`h.scoring_failed` 的窗口
+    会滑进 `h.pitch_failed` 的分支里，于是删掉前者的命令文案、断言照样能被
+    后者的文案满足。这里从分支开头一直取到它自己的 `: "")`。
+    """
+    start = HTML.find(f"({count_field} ?")
+    assert start != -1, f"横幅里找不到 {count_field} 的分支"
+    end = HTML.find(': "")', start)
+    assert end != -1, f"{count_field} 的三元分支没有找到结尾"
+    return HTML[start:end]
+
+
+@pytest.mark.parametrize("count_field", ["h.scoring_failed", "h.pitch_failed"])
+def test_failure_banners_name_the_command_that_reopens_the_jobs(count_field):
     """Important 4：横幅上的「打分失败 N 条」以前是条死路——run_score 永远
     不会再看这些岗位，面板上也没有入口。计数和重新入场的办法必须一起出现，
     否则这条提示只是在通知一个人工无法处理的事实。"""
-    for count_field in ("h.scoring_failed", "h.pitch_failed"):
-        start = HTML.find(f"({count_field} ?")
-        assert start != -1, f"横幅里找不到 {count_field} 的分支"
-        branch = HTML[start : start + 400]
-        assert "jobstar score --rescore" in branch, (
-            f"{count_field} 的横幅没有给出重新入场的命令"
-        )
+    branch = _ternary_branch(count_field)
+    assert count_field in branch
+    assert "jobstar score --rescore" in branch, (
+        f"{count_field} 的横幅没有给出重新入场的命令"
+    )
+
+
+def test_ternary_branch_helper_does_not_bleed_into_its_neighbour():
+    """上面那条断言靠 _ternary_branch 精确切分。如果切分又滑进隔壁分支，
+    两条断言会同时被同一段文案满足，删掉其中一条的命令也测不出来。"""
+    scoring = _ternary_branch("h.scoring_failed")
+    assert "h.pitch_failed" not in scoring
+    assert scoring.count("jobstar score --rescore") == 1
+
+
+# 允许不经过 esc()/safeHref() 的插值。每一条都要能说清「为什么这个值不可能
+# 是攻击者控制的字符串」——不是「看起来像数字」，而是产品代码保证它是数字。
+# 加新条目意味着你要为它给出同样强度的理由。
+UNESCAPED_ALLOWLIST = {
+    # /api/health 的计数：COUNT(*) 或 len()，见 panel/app.py:health
+    "h.sent_today", "h.remaining_quota", "h.pending", "h.scoring_failed",
+    "h.pitch_failed", "h.uncertain", "h.interrupted",
+    # daily_greeting_limit 是配置项，写入时 validate_setting_value 强制
+    # 「非负整数」（config.py），不可能是字符串
+    "h.daily_limit",
+    # actions.id：SQLite INTEGER PRIMARY KEY
+    "row.action_id", "i.action_id",
+    # scores.total / DimensionScore.score：打分器算出来的数字
+    'i.total ?? "-"', "j.total", "dim.score",
+    # /api/threshold 返回的统计量，全部由 _stats() 用 min/max/sum 算出
+    "t.labeled_total", "g.count", "g.min", "g.max", "g.mean",
+    "f(t.would_apply)", "f(t.would_not_apply)",
+    't.scores_yes.join(", ") || "无"', 't.scores_no.join(", ") || "无"',
+    # 本地拼好的 HTML 片段，内部的值已经各自转义过
+    "noteHtml",
+}
+
+# 这些插值不产生 HTML：URL 路径片段和 alert() 的纯文本参数。
+NON_HTML_SINKS = ("await api(`/api/", "alert(`")
+
+
+def _leaf_interpolations(line: str) -> list[str]:
+    """这一行里所有**最内层**的 `${...}`。
+
+    只看最内层是有意的。像 `${dim.cards.map(c => `…${esc(c.id)}…`).join("")}`
+    这种嵌套，外层本身不产出任何未经处理的值——真正落到 innerHTML 上的值
+    全部来自内层的那几个 `${}`，而它们各自会被单独扫到。反过来把外层整体
+    放进白名单才是危险的：那会连带豁免它内部所有插值。
+    """
+    leaves = []
+    for start in (i for i in range(len(line) - 1) if line[i : i + 2] == "${"):
+        depth, pos = 0, start + 1
+        while pos < len(line):
+            if line[pos] == "{":
+                depth += 1
+            elif line[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            pos += 1
+        else:
+            continue  # 这一行里没闭合（跨行模板），交给它闭合的那一行去看
+        body = line[start + 2 : pos]
+        if "${" not in body:
+            leaves.append(body.strip())
+    return leaves
+
+
+def test_every_interpolation_that_reaches_innerhtml_is_escaped():
+    """Important 1 的另一半：只钉住 esc() 函数本身是不够的——把 esc() 从
+    某个渲染点删掉，函数级的测试照样全绿。这里逐个检查调用点。
+
+    面板全部是 innerHTML 字符串拼接，没有任何自动转义的模板引擎，所以
+    「插值必须经过 esc()/safeHref()」是唯一的防线，必须逐点成立。
+    """
+    offenders = []
+    for lineno, line in enumerate(HTML.splitlines(), start=1):
+        if line.strip().startswith("//") or any(s in line for s in NON_HTML_SINKS):
+            continue
+        for expr in _leaf_interpolations(line):
+            if expr.startswith(("esc(", "safeHref(")) or expr in UNESCAPED_ALLOWLIST:
+                continue
+            offenders.append(f"{INDEX.name}:{lineno}: ${{{expr}}}")
+    assert not offenders, (
+        "这些插值既没经过 esc()/safeHref()，也不在白名单里：\n"
+        + "\n".join(offenders)
+        + "\n\n如果确实安全，把它加进 UNESCAPED_ALLOWLIST 并写清理由。"
+    )

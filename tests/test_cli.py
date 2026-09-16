@@ -231,17 +231,23 @@ def test_collect_structural_change_does_not_advance_ok_at(
 # --- Important 4：`score --rescore` 的命令行接线 ---
 
 
-def _stub_score_pipeline(monkeypatch):
-    """把 run_score / clear_for_rescore 换成记账用的桩，只验证接线。"""
-    calls: dict[str, object] = {"cleared": None, "scored": False}
+def _stub_score_pipeline(monkeypatch, report: ScoreReport | None = None):
+    """把 run_score / clear_for_rescore 换成记账用的桩。
+
+    记的是**有序**的调用日志而不是两个独立的布尔标志：清场必须发生在打分
+    之前（反过来的话第一轮打分看到的还是吸收态，等于没重跑），而且两次
+    调用拿到的 job_id 必须一致——只限定清场范围、让打分全库跑，会对人工
+    没点名的岗位调 LLM 写话术、生成待确认动作。独立标志观察不到这两件事。
+    """
+    calls: list[tuple[str, object]] = []
 
     def fake_clear(conn, *, job_id=None):
-        calls["cleared"] = job_id if job_id is not None else "ALL"
+        calls.append(("clear", job_id))
         return 3
 
-    def fake_run_score(conn, *, limit=None):
-        calls["scored"] = True
-        return ScoreReport(scored=1)
+    def fake_run_score(conn, *, limit=None, job_id=None):
+        calls.append(("score", job_id))
+        return report if report is not None else ScoreReport(scored=1)
 
     monkeypatch.setattr("jobstar.pipeline.clear_for_rescore", fake_clear)
     monkeypatch.setattr("jobstar.pipeline.run_score", fake_run_score)
@@ -256,27 +262,29 @@ def test_score_without_rescore_never_clears_absorbing_states(
     calls = _stub_score_pipeline(monkeypatch)
 
     assert main(["score"]) == 0
-    assert calls["cleared"] is None
-    assert calls["scored"] is True
+    assert calls == [("score", None)]
     assert "已清除" not in capsys.readouterr().out
 
 
-def test_score_rescore_clears_then_scores(monkeypatch, tmp_path, capsys):
+def test_score_rescore_clears_before_scoring(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
     calls = _stub_score_pipeline(monkeypatch)
 
     assert main(["score", "--rescore"]) == 0
-    assert calls["cleared"] == "ALL"
-    assert calls["scored"] is True
+    assert calls == [("clear", None), ("score", None)], "清场必须发生在打分之前"
     assert "已清除 3 个岗位" in capsys.readouterr().out
 
 
-def test_score_rescore_accepts_single_job_id(monkeypatch, tmp_path):
+def test_rescore_job_id_scopes_scoring_too_not_just_clearing(monkeypatch, tmp_path):
+    """`--job-id` 的 help 写的是「只重跑这一个岗位」。如果它只传给清场、
+    不传给打分，那么库里任何一个「已抓详情、门禁通过、还没打过分」的岗位
+    都会被顺带打分并生成待确认招呼——人工被告知只重跑了一个，面板上却
+    多出一堆待确认项，误批准的概率被抬高，LLM 花费也在计划之外。"""
     monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
     calls = _stub_score_pipeline(monkeypatch)
 
     assert main(["score", "--rescore", "--job-id", "abc123"]) == 0
-    assert calls["cleared"] == "abc123"
+    assert calls == [("clear", "abc123"), ("score", "abc123")]
 
 
 def test_job_id_without_rescore_is_rejected(monkeypatch, tmp_path, capsys):
@@ -289,3 +297,57 @@ def test_job_id_without_rescore_is_rejected(monkeypatch, tmp_path, capsys):
         main(["score", "--job-id", "abc123"])
     assert exc.value.code == 2
     assert "--job-id 必须配合 --rescore 使用" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_job_id_is_rejected_instead_of_silently_meaning_all(
+    monkeypatch, tmp_path, capsys, blank
+):
+    """空串是假值，`if args.job_id` 会把它当成没传：既绕过「必须配合
+    --rescore」的校验，又在下游被 `? IS NULL` 当成「全部」。人工以为点名了
+    一个岗位，实际是全库跑。"""
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+    calls = _stub_score_pipeline(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["score", "--rescore", "--job-id", blank])
+    assert exc.value.code == 2
+    assert "--job-id 不能是空串" in capsys.readouterr().err
+    assert calls == [], "报错必须发生在任何清场/打分之前"
+
+
+def test_rescore_reports_retractions_and_skipped_regeneration(
+    monkeypatch, tmp_path, capsys
+):
+    """撤回是机器替人做的状态变更，不能悄悄发生；`already_queued` 也不能被
+    折进「入队 N」——那会让人去面板上找根本不存在的待确认项。"""
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+    _stub_score_pipeline(
+        monkeypatch, ScoreReport(scored=5, enqueued=1, already_queued=2, retracted=2)
+    )
+
+    assert main(["score", "--rescore"]) == 0
+    captured = capsys.readouterr()
+    assert "入队 1" in captured.out
+    assert "2 条岗位队列里已有招呼动作" in captured.out
+    assert "2 条已入队的招呼在重跑后不再合格，已自动撤回成「跳过」" in captured.err
+
+
+def test_rescore_says_so_when_nothing_was_in_an_absorbing_state(
+    monkeypatch, tmp_path, capsys
+):
+    """清了 0 条是个正常结果（点名的岗位本来就没卡住），但人工必须能看懂
+    「这一轮和不加 --rescore 完全一样」，而不是以为重跑生效了。"""
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+
+    def fake_clear(conn, *, job_id=None):
+        return 0
+
+    monkeypatch.setattr("jobstar.pipeline.clear_for_rescore", fake_clear)
+    monkeypatch.setattr(
+        "jobstar.pipeline.run_score",
+        lambda conn, *, limit=None, job_id=None: ScoreReport(),
+    )
+
+    assert main(["score", "--rescore"]) == 0
+    assert "和不加 --rescore 完全一样" in capsys.readouterr().err

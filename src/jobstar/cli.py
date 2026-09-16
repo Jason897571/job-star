@@ -31,7 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     p_score.add_argument(
         "--job-id",
         default=None,
-        help="配合 --rescore 只重跑这一个岗位；不传则重跑所有符合条件的岗位",
+        help="配合 --rescore 只重跑这一个岗位（清场和打分都只作用于它）；"
+        "不传则重跑所有符合条件的岗位",
     )
 
     sub.add_parser("send", help="执行队列中已批准的动作")
@@ -123,20 +124,47 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "score":
         from jobstar.pipeline import clear_for_rescore, run_score
 
-        if args.job_id and not args.rescore:
-            parser.error("--job-id 必须配合 --rescore 使用")
+        # `args.job_id and ...` 会把 `--job-id ""` 当成没传，于是既绕过这条
+        # 校验、又在下游被 `? IS NULL` 当成"全部"——人工以为点名了一个岗位，
+        # 实际是全库跑。空串不是一个合法的岗位号，直接报错。
+        if args.job_id is not None:
+            if not args.rescore:
+                parser.error("--job-id 必须配合 --rescore 使用")
+            if not args.job_id.strip():
+                parser.error("--job-id 不能是空串")
 
         if args.rescore:
             cleared = clear_for_rescore(conn, job_id=args.job_id)
             print(f"已清除 {cleared} 个岗位的吸收态（scoring_failed/pitch_failed/"
                   "第二遍门禁刷掉），准备重新处理")
+            if cleared == 0:
+                print(
+                    "  （没有岗位处于吸收态。本轮只会处理从未打过分的岗位，"
+                    "和不加 --rescore 完全一样）",
+                    file=sys.stderr,
+                )
 
-        report = run_score(conn, limit=args.limit)
+        # job_id 必须同时约束打分范围：只用它限定清场、却让打分全库跑，
+        # 等于对人工没点名的岗位调 LLM 写话术、生成待确认动作。
+        report = run_score(conn, limit=args.limit, job_id=args.job_id)
         print(
             f"打分 {report.scored}，门禁刷掉 {report.gated_out}，"
             f"失败 {report.failed}，话术失败 {report.pitch_failed}，"
             f"入队 {report.enqueued}"
         )
+        if report.already_queued:
+            print(
+                f"  {report.already_queued} 条岗位队列里已有招呼动作，本轮没有"
+                "重新生成话术（旧话术保持不动，台账里记的必须是真正发出去的那版）"
+            )
+        if report.retracted:
+            # 撤回是一次机器替人做的状态变更，不能悄悄发生——哪怕方向是
+            # 安全的（只会少发不会多发）。
+            print(
+                f"⚠️  {report.retracted} 条已入队的招呼在重跑后不再合格，已自动"
+                "撤回成「跳过」；到面板确认无误后可以再点确认恢复",
+                file=sys.stderr,
+            )
         for err in report.errors:
             print(f"  ! {err}", file=sys.stderr)
         return 0

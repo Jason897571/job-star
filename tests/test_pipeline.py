@@ -469,3 +469,204 @@ def test_rescore_does_not_resurrect_or_duplicate_an_existing_action(conn, monkey
     assert json.loads(rows[0]["payload"])["greeting"] == "第一版开场白", (
         "payload 也不该被新话术覆盖——那会让台账里记的和真正发出去的不一致"
     )
+
+
+# --- 重跑的作用域与旧动作的处置 ---
+#
+# clear_for_rescore 只清 scores/gate_results/jobs.status，动作表原封不动。
+# 这在「重跑后结论没变」时是对的（不重复入队、不覆盖已发出的话术），但
+# 「重跑后结论变了」时会留下一条按旧结论生成的招呼躺在待确认队列里——
+# 面板不显示 jobs.status，人工看不出它已经作废，点一下确认就发出去了。
+
+
+def test_run_score_job_id_scopes_the_scoring_not_just_the_clearing(conn, monkeypatch):
+    """只限定清场范围而让打分全库跑，等于对人工没点名的岗位调 LLM 写话术、
+    生成待确认动作——而命令行还在说「只重跑这一个」。"""
+    from jobstar.llm import LLMSchemaError
+
+    set_setting(conn, "score_threshold", 70)
+    for job_id in ("broken", "other1", "other2"):
+        _seed_scorable(conn, job_id)
+
+    def boom(**kwargs):
+        raise LLMSchemaError("坏了")
+
+    monkeypatch.setattr("jobstar.pipeline.normalize", boom)
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    # 第一轮只让 broken 进去，other1/other2 保持「从没打过分」
+    assert run_score(conn, job_id="broken").failed == 1
+
+    normalized: list[str] = []
+    pitched: list[str] = []
+
+    def ok_normalize(**kwargs):
+        normalized.append(kwargs["job_id"])
+        return _req(kwargs["job_id"])
+
+    def ok_pitch(**kwargs):
+        pitched.append(kwargs["req"].job_id)
+        return "开场白"
+
+    monkeypatch.setattr("jobstar.pipeline.normalize", ok_normalize)
+    monkeypatch.setattr("jobstar.pipeline.write_pitch", ok_pitch)
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 80.0, (), "v1"),
+    )
+
+    assert clear_for_rescore(conn, job_id="broken") == 1
+    report = run_score(conn, job_id="broken")
+
+    assert (report.scored, report.enqueued) == (1, 1)
+    assert normalized == ["broken"], "没点名的岗位不该被归一化"
+    assert pitched == ["broken"], "没点名的岗位不该被调 LLM 写话术"
+    assert [r["job_id"] for r in conn.execute("SELECT job_id FROM actions")] == [
+        "broken"
+    ]
+
+
+def test_clear_for_rescore_resets_job_status_to_new(conn, monkeypatch):
+    """jobs.status 留在 scoring_failed 的话，面板 /api/health 的「打分失败
+    N 条」会一直把一个已经清干净、正等着重跑的岗位算进去。"""
+    from jobstar.llm import LLMSchemaError
+
+    _seed_scorable(conn, "j1")
+
+    def boom(**kwargs):
+        raise LLMSchemaError("坏了")
+
+    monkeypatch.setattr("jobstar.pipeline.normalize", boom)
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    run_score(conn)
+    assert conn.execute(
+        "SELECT status FROM jobs WHERE job_id='j1'"
+    ).fetchone()["status"] == "scoring_failed"
+
+    clear_for_rescore(conn)
+    assert conn.execute(
+        "SELECT status FROM jobs WHERE job_id='j1'"
+    ).fetchone()["status"] == "new"
+
+
+def _rescore_setup(conn, monkeypatch, *, second_total: float = 80.0):
+    """先跑出一条 pending 招呼，再把桩换成第二轮的样子。返回动作 id。"""
+    set_setting(conn, "score_threshold", 70)
+    _seed_scorable(conn, "j1")
+    monkeypatch.setattr("jobstar.pipeline.normalize", lambda **kw: _req(kw["job_id"]))
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    monkeypatch.setattr("jobstar.pipeline.write_pitch", lambda **kw: "第一版开场白")
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 90.0, (), "v1"),
+    )
+    assert run_score(conn).enqueued == 1
+    action_id = list_by_status(conn, PENDING)[0]["id"]
+
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, second_total, (), "v1"),
+    )
+    return action_id
+
+
+def test_rescore_retracts_a_queued_greeting_the_gate_now_rejects(conn, monkeypatch):
+    """人工把公司拉黑之后重跑：岗位被第二遍门禁刷掉，但队列里那条招呼
+    仍然是 pending、卡片上还是旧话术，面板不显示 jobs.status——人工点一下
+    确认就发给了刚被自己拉黑的公司。"""
+    from jobstar import actions
+
+    action_id = _rescore_setup(conn, monkeypatch)
+    set_setting(
+        conn,
+        "gate_rules",
+        {**get_setting(conn, "gate_rules"), "company_blacklist": ["A公司"]},
+    )
+
+    assert clear_for_rescore(conn) == 1
+    report = run_score(conn)
+    assert (report.gated_out, report.retracted) == (1, 1)
+
+    row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert row["status"] == actions.SKIPPED
+    assert "重跑后被门禁刷掉" in row["error"]
+    assert "公司在黑名单：A公司" in row["error"]
+    assert list_by_status(conn, PENDING) == [], "不该再出现在待确认队列里"
+
+
+def test_rescore_retracts_a_queued_greeting_that_now_scores_below_threshold(
+    conn, monkeypatch
+):
+    """调高阈值或改了权重之后分数掉下来：旧招呼是按 90 分写的，现在只有
+    40 分，队列里却照旧摆着，卡片上的分数和话术出自两套互不相干的依据。"""
+    from jobstar import actions
+
+    action_id = _rescore_setup(conn, monkeypatch, second_total=40.0)
+
+    assert clear_for_rescore(conn) == 1
+    report = run_score(conn)
+    assert (report.scored, report.enqueued, report.retracted) == (1, 0, 1)
+
+    row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert row["status"] == actions.SKIPPED
+    assert "低于阈值" in row["error"]
+
+
+def test_retraction_is_reversible_by_the_human(conn, monkeypatch):
+    """撤回的方向是安全的（只会少发不会多发），但不能是不可逆的——人工
+    看过之后要能再点确认恢复。"""
+    from jobstar import actions
+
+    action_id = _rescore_setup(conn, monkeypatch, second_total=40.0)
+    clear_for_rescore(conn)
+    run_score(conn)
+
+    actions.approve(conn, action_id)
+    assert conn.execute(
+        "SELECT status FROM actions WHERE id=?", (action_id,)
+    ).fetchone()["status"] == actions.APPROVED
+
+
+@pytest.mark.parametrize("already_sent", [True, False])
+def test_rescore_never_retracts_an_action_that_may_already_have_been_sent(
+    conn, monkeypatch, already_sent
+):
+    """sending 是「消息可能已经发出、但还没确认」的诚实中间态，sent 是确实
+    发出去了。把它们改成「跳过」只会让台账和事实不符——而且 skipped 是允许
+    再被批准的来源状态，等于给同一个真人开了重发的口子。"""
+    from jobstar import actions
+
+    action_id = _rescore_setup(conn, monkeypatch, second_total=40.0)
+    actions.approve(conn, action_id)
+    actions.mark_sending(conn, action_id)
+    if already_sent:
+        actions.mark_sent(conn, action_id)
+    expected = actions.SENT if already_sent else actions.SENDING
+
+    assert clear_for_rescore(conn) == 1
+    assert run_score(conn).retracted == 0, f"{expected} 不该被撤回"
+    assert conn.execute(
+        "SELECT status FROM actions WHERE id=?", (action_id,)
+    ).fetchone()["status"] == expected
+
+
+def test_rescore_does_not_regenerate_a_pitch_for_an_action_that_already_exists(
+    conn, monkeypatch
+):
+    """重跑结论没变时，enqueue 是 DO NOTHING——话术会被生成出来然后原样
+    丢弃，白烧一次 LLM 调用；而 report.enqueued 还会把这次空操作计成入队，
+    让人去面板找根本不存在的待确认项。"""
+    action_id = _rescore_setup(conn, monkeypatch)
+
+    pitches: list[str] = []
+    monkeypatch.setattr(
+        "jobstar.pipeline.write_pitch",
+        lambda **kw: pitches.append(kw["req"].job_id) or "第二版开场白",
+    )
+
+    assert clear_for_rescore(conn) == 1
+    report = run_score(conn)
+
+    assert (report.scored, report.enqueued, report.already_queued) == (1, 0, 1)
+    assert pitches == [], "队列里已有动作，不该再调一次 LLM 写话术"
+    row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert json.loads(row["payload"])["greeting"] == "第一版开场白"
