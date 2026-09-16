@@ -580,3 +580,66 @@ def test_index_banner_guards_no_anomaly_claim_on_mismatch(client):
     html = client.get("/").text
     assert "last_collect_ok_at" in html
     assert "h.last_collect_at === h.last_collect_ok_at" in html
+
+
+# --- 人工清空话术后点「确认发送」 ---
+#
+# 原来 approve 用的是 `if body.get("greeting")` 真值判断：空串是假值，
+# override 保持 None，于是批准的是库里那版 LLM 原稿。人工看着空框点了
+# 「确认发送」，发出去的却是他没看过、更没同意的那段文字——这直接违反
+# 「人工批准的就是发出去的那段」。
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+def test_approve_refuses_a_blank_greeting_instead_of_falling_back_to_the_draft(
+    client, blank
+):
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "LLM 原稿"}
+    )
+    resp = client.post(
+        f"/api/actions/{action_id}/approve",
+        json={"greeting": blank},
+        headers=PANEL_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert "话术是空的" in resp.json()["detail"]
+
+    row = client.conn.execute(
+        "SELECT status, payload FROM actions WHERE id=?", (action_id,)
+    ).fetchone()
+    assert row["status"] == PENDING, "被拒绝的批准不该改变状态"
+    assert "LLM 原稿" in row["payload"], "库里那版原稿也不该被动过"
+
+
+def test_approve_rejects_a_non_string_greeting(client):
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "原稿"}
+    )
+    resp = client.post(
+        f"/api/actions/{action_id}/approve",
+        json={"greeting": {"不是": "字符串"}},
+        headers=PANEL_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert "话术必须是字符串" in resp.json()["detail"]
+    assert client.conn.execute(
+        "SELECT status FROM actions WHERE id=?", (action_id,)
+    ).fetchone()["status"] == PENDING
+
+
+def test_approve_without_a_greeting_key_still_keeps_the_stored_draft(client):
+    """「键不存在」和「键存在但是空」是两件事：程序化批准（面板的跳过按钮、
+    CLI、测试）不带 greeting 键，那是明确的「不改话术」，必须继续放行。"""
+    action_id = enqueue(
+        client.conn, type="send_greeting", job_id="j1", payload={"greeting": "原稿"}
+    )
+    resp = client.post(
+        f"/api/actions/{action_id}/approve", json={}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 200
+    row = client.conn.execute(
+        "SELECT status, payload FROM actions WHERE id=?", (action_id,)
+    ).fetchone()
+    assert row["status"] == "approved"
+    assert "原稿" in row["payload"]

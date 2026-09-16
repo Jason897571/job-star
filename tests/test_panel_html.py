@@ -267,3 +267,33 @@ def test_every_interpolation_that_reaches_innerhtml_is_escaped():
         + "\n".join(offenders)
         + "\n\n如果确实安全，把它加进 UNESCAPED_ALLOWLIST 并写清理由。"
     )
+
+
+def test_render_clears_the_error_banner_first():
+    """下面那条测试的前提：render() 一进来就 clearError()。如果哪天不再是
+    这样，那条测试锁的顺序就失去意义，应该一起重新考虑。"""
+    body = HTML[HTML.index("async function render()") :]
+    body = body[: body.index("\n}")]
+    assert "clearError();" in body
+
+
+def test_action_handlers_report_errors_after_rerendering_not_before():
+    """`showError(err)` 必须排在 `render()` 之后。
+
+    render() 开头就 clearError()，所以「先报错、再重渲染」会让刚写上去的
+    错误横幅在同一帧里被抹掉——人工看到的是「点了确认，什么都没发生」。
+    这两个处理器上的错误恰恰是最不能丢的：话术为空被拒（否则人工会以为
+    是按库里那版 LLM 原稿发出去了），以及 409 状态冲突（这一行在别处已经
+    被跳过或被执行器认领）。
+    """
+    offenders = []
+    for marker in ("/api/actions/${id}/${act}", "/api/actions/${id}/resolve"):
+        start = HTML.index(marker)
+        block = HTML[start : HTML.index("\n  }", start)]
+        assert "showError(err)" in block, f"{marker} 的处理器没有报错分支"
+        if block.index("await render()") > block.index("showError(err)"):
+            offenders.append(marker)
+    assert not offenders, (
+        "这些处理器先报错再 render()，错误横幅会被 clearError() 抹掉：\n"
+        + "\n".join(offenders)
+    )

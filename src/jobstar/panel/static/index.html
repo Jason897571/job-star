@@ -272,7 +272,16 @@ document.addEventListener("click", async (e) => {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(act === "approve" ? { greeting } : {}),
       });
-    } catch (err) { showError(err); }
+    } catch (err) {
+      // showError 必须排在 render() 之后：render() 开头就 clearError()，
+      // 先报错再重渲染的话，刚写上去的错误横幅会在同一帧里被抹掉——人工
+      // 看到的是「点了确认，什么都没发生」。而这里的两条错误恰恰是最不能
+      // 丢的：话术为空被拒（否则人工以为按库里原稿发出去了），以及 409
+      // 状态冲突（这一行在别处已经被跳过/认领）。先 render 让队列反映真实
+      // 状态，再把解释写上去。
+      await render();
+      return showError(err);
+    }
     return render();
   }
   // Minor 5：resolve 按钮——人工去 Boss 对话列表核实过一条 sending 行之后，
@@ -287,7 +296,10 @@ document.addEventListener("click", async (e) => {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ outcome: resolve }),
       });
-    } catch (err) { showError(err); }
+    } catch (err) {
+      await render();  // 同上：render() 会 clearError()，报错必须排在它之后
+      return showError(err);
+    }
     return render();
   }
   const detail = e.target.dataset.detail;

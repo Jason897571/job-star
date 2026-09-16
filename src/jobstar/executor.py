@@ -331,6 +331,23 @@ def run_queue(
             (row["job_id"],),
         ).fetchone()
         url = (job["url"] if job else None) or ""
+        if not isinstance(greeting, str) or not greeting.strip():
+            # 最后一道闸：面板的 approve 已经挡住了空话术，但执行器是真正
+            # 按下发送键的那一环，不该依赖上游的校验——payload 也可能来自
+            # 手改库文件或将来某个绕开面板的写入点。空消息发出去既没意义，
+            # 又会消耗一次每日配额和一个真人的注意力。和缺 URL 同样处理：
+            # 不打开浏览器，标记失败留痕，且排在 attempted 之前（这一行从
+            # 未真正调用 send_fn，不该替下一行占掉一次人类延迟）。
+            _guarded_write(
+                report,
+                row["job_id"],
+                lambda: actions.mark_failed(
+                    conn, row["id"], "话术为空，未打开浏览器"
+                ),
+            )
+            report.failed += 1
+            report.errors.append(f"{row['job_id']}: 话术为空，拒绝发送")
+            continue
         if not url:
             # 缺 URL 就不该打开浏览器再失败——那样真实的 send_fn 会导航到
             # 空地址，白白多等一轮超时才报错。这一行已经被认领成 sending，

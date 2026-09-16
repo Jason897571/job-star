@@ -768,3 +768,40 @@ def test_no_url_row_does_not_consume_first_send_delay_exemption(conn):
     assert report.failed == 1, "nourl 行失败但从未调用 send_fn"
     assert len(sent) == 1
     assert delays == [], "唯一一次真正发送之前不该有延迟"
+
+
+# --- 空话术：执行器这一层的兜底 ---
+
+
+@pytest.mark.parametrize("greeting", ["", "   ", "\n"])
+def test_never_opens_the_browser_for_an_empty_greeting(conn, greeting):
+    """面板的 approve 已经挡住了空话术，但执行器是真正按下发送键的那一环，
+    不该依赖上游的校验——payload 也可能来自手改库文件或将来某个绕开面板的
+    写入点。空消息发出去既没意义，又会消耗一次每日配额和一个真人的注意力。"""
+    action_id = _approved(conn, "j1", greeting=greeting)
+    sent = []
+
+    report = run_queue(
+        conn, send_fn=lambda u, t: sent.append(t), sleep_fn=lambda _: None
+    )
+
+    assert sent == [], "根本不该调用 send_fn"
+    assert (report.sent, report.failed) == (0, 1)
+    row = conn.execute("SELECT status, error FROM actions WHERE id=?", (action_id,)).fetchone()
+    assert row["status"] == FAILED
+    assert "话术为空" in row["error"]
+
+
+def test_empty_greeting_does_not_burn_the_human_delay_for_the_next_row(conn):
+    """这一行从未真正调用 send_fn，不该替下一行——很可能是本轮第一次真正
+    发送——占掉一次 5-600 秒的人类延迟（和缺 URL 那条分支同样的理由）。"""
+    _approved(conn, "empty", greeting="")
+    _approved(conn, "real", greeting="正常话术")
+    delays = []
+
+    report = run_queue(
+        conn, send_fn=lambda u, t: None, sleep_fn=delays.append
+    )
+
+    assert (report.sent, report.failed) == (1, 1)
+    assert delays == [], "本轮只有一次真正的发送，不该有任何延迟"

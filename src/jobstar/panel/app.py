@@ -281,10 +281,28 @@ def approve_action(
     ).fetchone()
     if row is None:
         raise HTTPException(404, "动作不存在")
+    # 「键不存在」和「键存在但是空串」是两件完全不同的事，不能都当成
+    # 「不覆盖」：
+    #   - 键不存在 = 调用方没打算改话术（程序化批准），保留库里那版；
+    #   - 键存在但为空 = 人工把话术框清空了。原来的 `if body.get(...)` 是
+    #     真值判断，空串是假值，于是 override 保持 None、批准的是库里那版
+    #     LLM 原稿——人工看着空框点了「确认发送」，发出去的却是他没看过、
+    #     更没同意的那段文字。这直接违反「人工批准的就是发出去的那段」。
+    # 空话术也不能直接放行：给 HR 发一条空消息既没意义，又会白白烧掉一次
+    # 每日配额和一个真人的注意力。这里报错，让人工自己决定是重写还是跳过。
     override = None
-    if body.get("greeting"):
+    if "greeting" in body:
+        greeting = body["greeting"]
+        if not isinstance(greeting, str):
+            raise HTTPException(
+                400, f"话术必须是字符串，收到的是 {type(greeting).__name__}"
+            )
+        if not greeting.strip():
+            raise HTTPException(
+                400, "话术是空的，拒绝按库里的原稿发送；请重写话术，或者点「跳过」"
+            )
         payload = json.loads(row["payload"])
-        payload["greeting"] = body["greeting"]
+        payload["greeting"] = greeting
         override = payload
     try:
         actions.approve(conn, action_id, override)
