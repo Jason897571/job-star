@@ -22,6 +22,17 @@ def main(argv: list[str] | None = None) -> int:
 
     p_score = sub.add_parser("score", help="归一化 + 门禁 + 打分")
     p_score.add_argument("--limit", type=int, default=None)
+    p_score.add_argument(
+        "--rescore",
+        action="store_true",
+        help="Minor 4：清掉 scoring_failed/pitch_failed/第二遍门禁刷掉这三种"
+        "吸收态，让对应岗位能被重新处理（不传时行为和以前完全一样）",
+    )
+    p_score.add_argument(
+        "--job-id",
+        default=None,
+        help="配合 --rescore 只重跑这一个岗位；不传则重跑所有符合条件的岗位",
+    )
 
     sub.add_parser("send", help="执行队列中已批准的动作")
 
@@ -110,12 +121,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "score":
-        from jobstar.pipeline import run_score
+        from jobstar.pipeline import clear_for_rescore, run_score
+
+        if args.job_id and not args.rescore:
+            parser.error("--job-id 必须配合 --rescore 使用")
+
+        if args.rescore:
+            cleared = clear_for_rescore(conn, job_id=args.job_id)
+            print(f"已清除 {cleared} 个岗位的吸收态（scoring_failed/pitch_failed/"
+                  "第二遍门禁刷掉），准备重新处理")
 
         report = run_score(conn, limit=args.limit)
         print(
             f"打分 {report.scored}，门禁刷掉 {report.gated_out}，"
-            f"失败 {report.failed}，入队 {report.enqueued}"
+            f"失败 {report.failed}，话术失败 {report.pitch_failed}，"
+            f"入队 {report.enqueued}"
         )
         for err in report.errors:
             print(f"  ! {err}", file=sys.stderr)

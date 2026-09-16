@@ -61,11 +61,14 @@ def _render_requirements(req: JobRequirements) -> str:
         if req.years_min is not None and req.years_max is not None
         else (f"{req.years_min}年以上" if req.years_min is not None else "不限")
     )
-    salary = (
-        f"{req.salary_min}-{req.salary_max}K"
-        if req.salary_min is not None
-        else "未提取到"
-    )
+    if req.salary_min is not None and req.salary_max is not None:
+        salary = f"{req.salary_min}-{req.salary_max}K"
+    elif req.salary_min is not None:
+        salary = f"{req.salary_min}K起（未提取到上限）"
+    elif req.salary_max is not None:
+        salary = f"{req.salary_max}K以下（未提取到下限）"
+    else:
+        salary = "未提取到"
     return (
         f"岗位类别: {req.category or '未提取到'}\n"
         f"行业: {req.industry or '未提取到'}\n"

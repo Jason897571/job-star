@@ -60,7 +60,19 @@ SELECTORS: dict[str, str] = {
 }
 
 # 登录墙的特征串。命中就中止采集，面板顶部挂横幅（设计文档 §7）。
-LOGIN_MARKERS = ("请先登录", "login", "/web/user/?ka=header-login")
+#
+# fix round 2（review finding 2）：裸词 "login" 只在 URL / page_info() 这类
+# 「页面导航去了哪」的文本里才是可靠信号——它只可能来自跳转到的登录页地址
+# 本身。放到详情页/列表页正文（JD 全文）上匹配就不成立了：后端/前端类 JD
+# 完全可能正常写到「单点登录 SSO/Login」「OAuth login」「登录模块」，命中
+# 裸词 "login" 会把一次正常岗位误判成登录态失效，中止整轮采集、把用户支去
+# 重新扫码登录一个根本没过期的会话。所以正文只用专有的中文特征串校验；
+# 裸词 "login" 和登录跳转链接片段只用于 URL/page_info() 这一侧。
+_URL_LOGIN_MARKERS = ("请先登录", "login", "/web/user/?ka=header-login")
+_BODY_LOGIN_MARKERS = ("请先登录",)
+
+# 向后兼容：曾经是唯一的一份常量，可能有外部调用点引用了这个名字。
+LOGIN_MARKERS = _URL_LOGIN_MARKERS
 
 # Boss 的职位列表是 Vue 异步渲染的，wait_for_load() 在 load 事件那一刻就返回，
 # 早于卡片渲染完成。轮询卡片选择器，给够时间等异步渲染跑完。
@@ -162,12 +174,29 @@ def _detail_extract_js() -> str:
     )
 
 
-def _guard_login(page_text: str) -> None:
+def _guard_login(page_text: str, *, markers: tuple[str, ...] = _URL_LOGIN_MARKERS) -> None:
+    """默认按 URL/page_info() 那一侧的特征串校验（含裸词 "login"）。
+
+    executor.py 直接复用这个函数校验发送流程里混杂了 page_info() 输出和
+    正文摘要的完整 stdout（见 executor.send_greeting 的文档字符串：它靠
+    「先看点击标记」的顺序而不是收窄特征串来防误判），保持默认参数不变
+    不会改变那条路径的既有行为。
+    """
     lowered = page_text.lower()
-    if any(marker.lower() in lowered for marker in LOGIN_MARKERS):
+    if any(marker.lower() in lowered for marker in markers):
         raise LoginRequired(
             "Boss 登录态失效，采集已中止。请在 Chrome 里重新扫码登录后重跑。"
         )
+
+
+def _guard_login_body(body_text: str) -> None:
+    """校验详情页/列表页正文（JD 全文一类的用户生成内容）。
+
+    只用专有中文特征串，不含裸词 "login"——理由见 _BODY_LOGIN_MARKERS 上方
+    的注释：JD 正文正常提到 SSO/OAuth login 的概率不可忽略，裸词匹配在这里
+    是假阳性温床。
+    """
+    _guard_login(body_text, markers=_BODY_LOGIN_MARKERS)
 
 
 def _looks_like_empty_result(body_snippet: str) -> bool:
@@ -215,7 +244,7 @@ def fetch_list(*, keyword: str, city_code: str, pages: int = 1) -> list[dict]:
             ) from exc
         raw_items = payload.get("items", [])
         body_snippet = payload.get("body_snippet", "")
-        _guard_login(body_snippet)
+        _guard_login_body(body_snippet)
         normalized = [i for i in (normalize_list_item(r) for r in raw_items) if i]
         if not normalized:
             if _looks_like_empty_result(body_snippet):
@@ -259,7 +288,7 @@ def fetch_detail(url: str) -> dict:
         raise CollectError(
             f"详情页提取结果不是 JSON：{data[:300]!r}；原始输出已存至 {dump_path}"
         ) from exc
-    _guard_login(payload.get("body_snippet", ""))
+    _guard_login_body(payload.get("body_snippet", ""))
     if not payload.get("raw_jd", "").strip():
         dump_path = dump_failure(f"detail-{job_id}-empty-jd", out, FAILURE_DIR)
         raise CollectError(

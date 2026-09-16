@@ -36,6 +36,12 @@ def write_pitch(
     for dim in result.dimensions:
         if dim.score > 0:
             cited.update(dim.card_ids)
+    if not cited:
+        # Minor 8：score_threshold=0 是合法配置，此时一个所有维度都是 0 分
+        # 的岗位也会入队。没有任何证据卡片可引用时，系统提示词仍然要求
+        # 「必须点到……具体项目和可量化结果」——矛盾指令 + 空证据集正是
+        # 编造捏造经历的温床。这里在 Python 侧把关，不依赖 prompt 自觉。
+        raise ValueError("没有任何维度有证据卡片支撑，拒绝生成话术（防止空证据下的编造）")
     card_index = {c.id: c for c in cards}
 
     card_lines = [

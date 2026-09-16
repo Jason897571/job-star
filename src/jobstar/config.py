@@ -36,7 +36,6 @@ SETTING_DEFAULTS: dict[str, Any] = {
         "bonus": 0.10,
     },
     "my_degree": "硕士",
-    "my_years": 5,
     # 采集健康状态。由 CLI 的 collect 子命令写入，面板顶部横幅读取（Task 13）。
     # last_collect_at 记录「最近一次尝试」（不论成败），last_collect_ok_at
     # 只在真正成功的那次采集上前进——两者不相等时，说明最近一次尝试其实
@@ -168,10 +167,6 @@ def validate_setting_value(key: str, value: Any) -> None:
 
         if value not in DEGREE_ORDER:
             raise ValueError(f"{key} 必须是 {sorted(DEGREE_ORDER)} 之一")
-
-    elif key == "my_years":
-        if not _is_number(value) or value < 0:
-            raise ValueError(f"{key} 必须是非负数字")
 
     elif key in ("last_collect_error", "last_collect_at", "last_collect_ok_at"):
         if value is not None and not isinstance(value, str):

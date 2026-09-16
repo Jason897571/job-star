@@ -7,6 +7,8 @@
   nav button { padding: 6px 14px; margin-right: 6px; cursor: pointer; }
   nav button.on { font-weight: 700; }
   .bar { padding: 8px 12px; border-radius: 6px; background: #f2f2f2; margin-bottom: 16px; font-size: 13px; }
+  .err { padding: 8px 12px; border-radius: 6px; background: #fdd; color: #900; margin-bottom: 16px; font-size: 13px; }
+  .err:empty { display: none; }
   .card { border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
   .card.uncertain { border-color: #b35; background: #fff6f6; }
   .meta { color: #666; font-size: 13px; }
@@ -20,6 +22,7 @@
   h3 { margin: 0 0 10px; }
   @media (prefers-color-scheme: dark) {
     .bar, .jd { background: #222; }
+    .err { background: #3a1414; color: #f88; }
     .card { border-color: #444; }
     .card.uncertain { background: #2a1414; border-color: #c66; }
   }
@@ -32,6 +35,7 @@
   <button data-view="settings">设置</button>
 </nav>
 <div class="bar" id="bar"></div>
+<div class="err" id="err"></div>
 <div id="main"></div>
 
 <script>
@@ -42,7 +46,28 @@ const $ = (s) => document.querySelector(s);
 // panel/app.py 的 require_panel_request）。
 const api = (p, o) => fetch(p, { ...o, headers: { ...(o && o.headers), "X-Jobstar-Panel": "1" } })
   .then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)));
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+// Important 1：原来的正则不转义单引号，但设置视图把 esc() 的结果塞进单
+// 引号属性（value='${...}'）。last_collect_error 来自 CollectError 消息里
+// 的 `{data[:300]!r}`——Python 的 repr() 恒用单引号包裹，所以第一次 JSON
+// 解析失败的采集错误就能天然带出一个未转义的单引号，闭合掉属性、在设置
+// 页开一个事件处理器——攻击面已经在系统自己产出的错误文案里，不需要
+// 外部输入。这里补上单引号，连带审计过文件里其余的插值点：其余都是
+// 双引号属性，单引号只出现在设置视图那一处（下面 renderSettings 里）。
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+// Important 6：面板是 §7"不静默失败"唯一的人工入口，却是最容易悄悄吞掉
+// 后端错误的地方——api() 对任何非 2xx 都 reject，调用点一旦没接住，浏览器
+// 只会在 devtools 里留一条没人看的 unhandled rejection，页面本身什么都不
+// 显示。这里放一个跨视图共用的错误横幅：render() 统一 try/catch 兜住四个
+// 视图 + bar() 自身的失败；不经过 render() 的独立操作（清除采集错误、
+// 保存设置、标注、展开分数拆解）各自再包一层，失败时都调用 showError。
+function showError(err) {
+  const msg = (err && typeof err === "object" && "detail" in err)
+    ? err.detail
+    : (err && err.message) || String(err);
+  $("#err").innerHTML = `⚠️ ${esc(msg)}`;
+}
+function clearError() { $("#err").innerHTML = ""; }
 // url 来自采集器抓取的 <a href>（见 collector/boss.py），不是本系统自己
 // 生成的值——esc() 只挡得住 HTML 转义，挡不住 javascript: 这类协议。这里
 // 只放行 http(s) 链接，否则渲染成 "#"，防止一个被抓到的恶意 href 在人工
@@ -57,7 +82,14 @@ async function bar() {
     `今日已发 ${h.sent_today}/${h.daily_limit}，剩余 ${h.remaining_quota}` +
     `（${esc(h.quota_resets_at)} 重置）　|　待确认 ${h.pending}　|　阈值 ${esc(thr)}` +
     (h.scoring_failed ? `　|　<b class="gap">打分失败 ${h.scoring_failed} 条待人工处理</b>` : "") +
-    (h.uncertain ? `　|　<b class="gap">发送结果不确定 ${h.uncertain} 条，请到 Boss 对话列表人工核实</b>` : "");
+    // Minor 3：话术生成失败——分数是真的、只是没能写出话术——单独一条计数，
+    // 不和上面"打分失败"混在一起（那会让人误以为分数本身不可信）。
+    (h.pitch_failed ? `　|　<b class="gap">话术生成失败 ${h.pitch_failed} 条待人工处理</b>` : "") +
+    (h.uncertain ? `　|　<b class="gap">发送结果不确定 ${h.uncertain} 条，请到 Boss 对话列表人工核实</b>` : "") +
+    // Minor 5：另一种 sending——认领之后、真正发送之前被打断，error 是空的。
+    // 这类行以前在任何视图里都看不到，这里和"发送结果不确定"分开措辞，
+    // 因为它连发送按钮点没点到都不确定，不能用同一句话带过。
+    (h.interrupted ? `　|　<b class="gap">发送疑似中断 ${h.interrupted} 条，请到 Boss 对话列表人工核实</b>` : "");
   // 采集健康状态（Task 13）：被动信号，只反映上一次真的跑过 collect 时
   // 观察到的结果，不是主动的实时探活——所以措辞里如实带出「上次采集」
   // 而不是暗示"现在"的状态。last_collect_error 为空时不代表零结果一定是
@@ -81,19 +113,40 @@ async function bar() {
   }
   $("#bar").innerHTML = html;
   const btn = $("#clear-err");
-  if (btn) btn.onclick = async () => { await api("/api/health/clear-error", { method: "POST" }); bar(); };
+  if (btn) btn.onclick = async () => {
+    try { await api("/api/health/clear-error", { method: "POST" }); await bar(); }
+    catch (err) { showError(err); }
+  };
+}
+
+// Minor 5：两种 sending 都渲染成一张只读卡片 + 一对 resolve 按钮——人工去
+// Boss 对话列表核实过之后点哪个都行，两个按钮背后都只是记账（sending →
+// sent / sending → failed），不会真的发消息。noteHtml 是两种变体唯一的
+// 措辞区别：uncertain 有 error（发送按钮点了、读回确认失败），interrupted
+// 没有（进程在认领之后、真正发送之前被打断，连点没点到都不确定）。
+function _sendingCard(row, noteHtml) {
+  return `
+      <div class="card uncertain" data-resolve-id="${row.action_id}">
+        <b>${esc(row.title)}</b> · ${esc(row.company)}
+        <div class="meta"><a href="${safeHref(row.url)}" target="_blank">原页面</a></div>
+        ${noteHtml}
+        <div class="row">
+          <button data-resolve="sent">已确认送达</button>
+          <button data-resolve="failed">已确认未送达</button>
+        </div>
+      </div>`;
 }
 
 async function renderQueue() {
-  const { items, uncertain } = await api("/api/queue");
+  const { items, uncertain, interrupted } = await api("/api/queue");
   let html = "";
   if (uncertain.length) {
-    html += `<h3>发送结果不确定 —— 请人工到 Boss 对话列表核实</h3>` + uncertain.map(u => `
-      <div class="card uncertain">
-        <b>${esc(u.title)}</b> · ${esc(u.company)}
-        <div class="meta"><a href="${safeHref(u.url)}" target="_blank">原页面</a></div>
-        <div class="gap">${esc(u.error)}</div>
-      </div>`).join("");
+    html += `<h3>发送结果不确定 —— 请人工到 Boss 对话列表核实</h3>` +
+      uncertain.map(u => _sendingCard(u, `<div class="gap">${esc(u.error)}</div>`)).join("");
+  }
+  if (interrupted.length) {
+    html += `<h3>发送疑似中断 —— 执行器被打断，连是否点过发送都不确定，请人工到 Boss 对话列表核实</h3>` +
+      interrupted.map(u => _sendingCard(u, "")).join("");
   }
   if (!items.length) {
     html += "<p>队列为空。</p>";
@@ -155,18 +208,43 @@ async function renderSettings() {
   ).join("") + `<button id="save">保存</button>
     <div class="meta">值按 JSON 解析。score_threshold 填 null 表示冷启动期不生成动作。</div></div>`;
   $("#save").onclick = async () => {
+    clearError();
     const body = {};
     for (const el of document.querySelectorAll("[data-key]")) {
       try { body[el.dataset.key] = JSON.parse(el.value); }
       catch { alert(`${el.dataset.key} 不是合法 JSON`); return; }
     }
-    await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    await bar(); alert("已保存");
+    // Important 6：Task 12 加了 validate_setting_value 专门让坏设置在写入
+    // 时就 400——但改之前这里没有 try/catch，PUT 被 api() reject 之后
+    // 这个 async 函数直接整体失败，既不报错也不提示"已保存"，用户合理地
+    // 以为保存成功了。加 try/catch，把服务端的错误消息原样（转义后）
+    // 显示出来，而不是用一句含糊的"出错了"盖过去。
+    try {
+      await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      await bar();
+      alert("已保存");
+    } catch (err) {
+      showError(err);
+    }
   };
 }
 
 const VIEWS = { queue: renderQueue, label: renderLabel, threshold: renderThreshold, settings: renderSettings };
-async function render() { await bar(); await VIEWS[view](); }
+async function render() {
+  // Important 6：bar()/renderQueue()/renderLabel()/renderThreshold() 都在
+  // 这里统一 await——任何一个的 api() 调用失败，都会顺着这条 await 链条
+  // 冒泡到这里被兜住，而不是变成一个没人看的 unhandled rejection、把页面
+  // 晾在半渲染的状态。renderSettings() 本身的失败也会被这里兜住；它自己
+  // 的 #save 按钮另有一层 try/catch，因为那次失败发生在 render() 已经
+  // 返回之后。
+  clearError();
+  try {
+    await bar();
+    await VIEWS[view]();
+  } catch (err) {
+    showError(err);
+  }
+}
 
 document.addEventListener("click", async (e) => {
   const navBtn = e.target.closest("nav button");
@@ -184,21 +262,40 @@ document.addEventListener("click", async (e) => {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(act === "approve" ? { greeting } : {}),
       });
-    } catch (err) { alert(err.detail || "操作失败"); }
+    } catch (err) { showError(err); }
+    return render();
+  }
+  // Minor 5：resolve 按钮——人工去 Boss 对话列表核实过一条 sending 行之后，
+  // 点这里记录看到的结果。两个按钮都只是记账（sending → sent / sending →
+  // failed），不会打开浏览器、不会真的发消息。
+  const resolve = e.target.dataset.resolve;
+  if (resolve) {
+    const card = e.target.closest("[data-resolve-id]");
+    const id = card.dataset.resolveId;
+    try {
+      await api(`/api/actions/${id}/resolve`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ outcome: resolve }),
+      });
+    } catch (err) { showError(err); }
     return render();
   }
   const detail = e.target.dataset.detail;
   if (detail) {
     e.preventDefault();
     const box = e.target.closest(".card").querySelector(".detail");
-    const d = await api(`/api/jobs/${detail}`);
-    box.innerHTML = d.dimensions.map(dim => `
+    try {
+      const d = await api(`/api/jobs/${detail}`);
+      box.innerHTML = d.dimensions.map(dim => `
       <div style="margin-top:10px">
         <b>${esc(dim.label)}: ${dim.score}</b><br>
         <span class="meta">${esc(dim.reason)}</span><br>
         ${dim.cards.map(c => `<span class="meta">[${esc(c.id)}] ${esc(c.capability)}（证据${esc(c.strength)}）· ${esc(c.project)}</span><br>`).join("")}
         <span class="gap">缺口：${esc(dim.gap)}</span>
       </div>`).join("");
+    } catch (err) {
+      showError(err);
+    }
     return;
   }
   const yes = e.target.hasAttribute("data-label-yes");
@@ -209,10 +306,15 @@ document.addEventListener("click", async (e) => {
 async function label(wouldApply) {
   const card = document.querySelector("[data-label]");
   if (!card) return;
-  await api("/api/label", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ job_id: card.dataset.label, would_apply: wouldApply }),
-  });
+  try {
+    await api("/api/label", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: card.dataset.label, would_apply: wouldApply }),
+    });
+  } catch (err) {
+    showError(err);
+    return;
+  }
   render();
 }
 

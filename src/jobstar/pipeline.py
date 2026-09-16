@@ -45,6 +45,7 @@ class ScoreReport:
     scored: int = 0
     gated_out: int = 0
     failed: int = 0
+    pitch_failed: int = 0
     enqueued: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -190,6 +191,21 @@ def maybe_enqueue(
     退化为自己读一遍——直接调用 maybe_enqueue 的既有测试不用改。
     """
     threshold = get_setting(conn, "score_threshold")
+    if threshold is not None and (
+        not isinstance(threshold, (int, float)) or isinstance(threshold, bool)
+    ):
+        # Minor 12：写入路径上 validate_setting_value 已经把关，正常情况下
+        # 不会出现非数字/非 null 的 score_threshold；但这里读的是数据库里的
+        # 原始值，不受 set_setting 校验的保护范围（例如手改过库文件、或者
+        # 未来出现绕开 set_setting 的写入点）。不加这道防线的话，下面的
+        # `float(threshold)` 会抛 TypeError——这个类型不在 run_score 对
+        # maybe_enqueue 的 except 子句范围内，会带着整个批次一起炸穿，后面
+        # 排队的岗位全部得不到处理。改成 ValueError，让它和其他"这个岗位
+        # 出问题了"的失败走同一条本地化、不影响其余岗位的路径。
+        raise ValueError(
+            f"score_threshold 配置已损坏（{threshold!r} 既不是数字也不是 "
+            "null），拒绝据此决定是否入队；请到面板设置里修正"
+        )
     if threshold is None or result.total < float(threshold):
         return None
     if cards is None:
@@ -203,6 +219,79 @@ def maybe_enqueue(
         job_id=req.job_id,
         payload={"greeting": greeting, "title": title, "company": company},
     )
+
+
+def _save_pitch_failure(conn: sqlite3.Connection, job_id: str, error: str) -> None:
+    """Minor 3：`maybe_enqueue`（写话术）失败时的记录方式。
+
+    这个岗位的分数是真实、有效的——`save_score` 已经提交过——不能像
+    `scorer.save_failure` 那样把 `total`/`dimensions` 清空，那会让一个已经
+    成立的打分结果凭空消失。这里只在 `scores.error` 上追加一句话术失败的
+    说明，`total`/`dimensions` 保持不动；`jobs.status` 改成 'pitch_failed'，
+    在面板/`/api/health` 上和真正的打分失败（`jobs.status='scoring_failed'`，
+    `scores.total` 恒为 NULL）区分开——两者各有独立的计数字段，不会被混进
+    同一条"打分失败"提示里，人工也不会被引导去怀疑一个其实是正确的分数。
+
+    选择复用 `scores.error` 而不是新开一列：`total IS NULL` 这个既有信号
+    已经能把"真正打分失败"和"打分成功但话术失败"两种情况分开，不需要为
+    这第二种情况改表结构。"""
+    conn.execute("UPDATE scores SET error = ? WHERE job_id = ?", (error, job_id))
+    conn.execute(
+        "UPDATE jobs SET status = 'pitch_failed' WHERE job_id = ?", (job_id,)
+    )
+    conn.commit()
+
+
+def clear_for_rescore(conn: sqlite3.Connection, *, job_id: str | None = None) -> int:
+    """Minor 4：`jobstar score --rescore` 用的清场函数。
+
+    `run_score` 的查询要求 `scores.job_id IS NULL` 且 `gate_results.passed = 1`——
+    这是"只处理从未打过分的岗位"的正确默认行为，但也意味着三种状态一旦
+    写入就永远拿不到重新入场的机会：
+      - scoring_failed（归一化/打分失败，`scores.total` 恒为 NULL）
+      - pitch_failed（打分成功但话术生成失败，`scores.total` 不为 NULL）
+      - 已经成功打过分的岗位（校准 §5.3：改了 prompt/权重后，要能
+        重跑同一批标注过的岗位，对照新分数和标注的一致率）
+      - 第二遍门禁刷掉（`run_score` 自己的 `gate.check` 把同一行
+        `gate_results` 覆盖成 `passed=0`，此后 `run_score` 的 JOIN 永远
+        选不中它，哪怕后来放宽了 `gate_rules`）
+
+    这里只清掉阻止 `run_score` 重新处理的吸收态本身——删掉 `scores` 行、
+    把被第二遍门禁刷掉的 `gate_results.passed` 改回 1——不重新算分；重新
+    算分交给调用方紧接着再跑一次签名不变的 `run_score`（它会用当前的
+    `gate_rules`/`dimension_weights` 重新走一遍归一化 + 门禁 + 打分）。
+
+    只处理确实处于吸收态的岗位（有 `scores` 行，或 `gate_results.passed=0`），
+    不会误伤那些第一遍门禁就被刷掉、从未抓过详情页的岗位（`detail_fetched=0`
+    卡在最外层条件上，本来就够不着 `run_score`，这里也不该去动它们）。
+
+    传 `job_id` 只清这一条；不传清所有满足条件的行。返回被清掉的岗位数。
+    """
+    rows = conn.execute(
+        "SELECT j.job_id FROM jobs j "
+        "LEFT JOIN scores s ON s.job_id = j.job_id "
+        "LEFT JOIN gate_results g ON g.job_id = j.job_id "
+        "WHERE j.detail_fetched = 1 "
+        "AND (? IS NULL OR j.job_id = ?) "
+        "AND (s.job_id IS NOT NULL OR (g.job_id IS NOT NULL AND g.passed = 0))",
+        (job_id, job_id),
+    ).fetchall()
+    ids = [row["job_id"] for row in rows]
+    if not ids:
+        return 0
+
+    placeholders = ",".join("?" * len(ids))
+    conn.execute(f"DELETE FROM scores WHERE job_id IN ({placeholders})", ids)
+    conn.execute(
+        f"UPDATE gate_results SET passed = 1, reject_reason = NULL "
+        f"WHERE passed = 0 AND job_id IN ({placeholders})",
+        ids,
+    )
+    conn.execute(
+        f"UPDATE jobs SET status = 'new' WHERE job_id IN ({placeholders})", ids
+    )
+    conn.commit()
+    return len(ids)
 
 
 def run_score(conn: sqlite3.Connection, *, limit: int | None = None) -> ScoreReport:
@@ -271,6 +360,8 @@ def run_score(conn: sqlite3.Connection, *, limit: int | None = None) -> ScoreRep
             ) is not None:
                 report.enqueued += 1
         except (LLMSchemaError, LLMBackendError, ValueError) as exc:
+            _save_pitch_failure(conn, row["job_id"], f"话术生成失败：{exc}")
+            report.pitch_failed += 1
             report.errors.append(f"{row['job_id']} 话术生成失败: {exc}")
 
     return report
