@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import pytest
+
 from jobstar.cli import main
 from jobstar.collector.boss import LoginRequired
 from jobstar.config import get_setting
 from jobstar.db import get_conn
 from jobstar.executor import ExecutionReport
-from jobstar.pipeline import CollectReport
+from jobstar.pipeline import CollectReport, ScoreReport
 
 
 def test_send_surfaces_uncertain_and_login_required_warnings(
@@ -224,3 +226,66 @@ def test_collect_structural_change_does_not_advance_ok_at(
     conn2 = get_conn(tmp_path / "t.db")
     assert get_setting(conn2, "last_collect_ok_at") == "2026-09-01 08:00:00"
     assert get_setting(conn2, "last_collect_at") != "2026-09-01 08:00:00"
+
+
+# --- Important 4：`score --rescore` 的命令行接线 ---
+
+
+def _stub_score_pipeline(monkeypatch):
+    """把 run_score / clear_for_rescore 换成记账用的桩，只验证接线。"""
+    calls: dict[str, object] = {"cleared": None, "scored": False}
+
+    def fake_clear(conn, *, job_id=None):
+        calls["cleared"] = job_id if job_id is not None else "ALL"
+        return 3
+
+    def fake_run_score(conn, *, limit=None):
+        calls["scored"] = True
+        return ScoreReport(scored=1)
+
+    monkeypatch.setattr("jobstar.pipeline.clear_for_rescore", fake_clear)
+    monkeypatch.setattr("jobstar.pipeline.run_score", fake_run_score)
+    return calls
+
+
+def test_score_without_rescore_never_clears_absorbing_states(
+    monkeypatch, tmp_path, capsys
+):
+    """默认行为必须和以前完全一样：不传 --rescore 就一行都不清。"""
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+    calls = _stub_score_pipeline(monkeypatch)
+
+    assert main(["score"]) == 0
+    assert calls["cleared"] is None
+    assert calls["scored"] is True
+    assert "已清除" not in capsys.readouterr().out
+
+
+def test_score_rescore_clears_then_scores(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+    calls = _stub_score_pipeline(monkeypatch)
+
+    assert main(["score", "--rescore"]) == 0
+    assert calls["cleared"] == "ALL"
+    assert calls["scored"] is True
+    assert "已清除 3 个岗位" in capsys.readouterr().out
+
+
+def test_score_rescore_accepts_single_job_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+    calls = _stub_score_pipeline(monkeypatch)
+
+    assert main(["score", "--rescore", "--job-id", "abc123"]) == 0
+    assert calls["cleared"] == "abc123"
+
+
+def test_job_id_without_rescore_is_rejected(monkeypatch, tmp_path, capsys):
+    """`--job-id` 单独出现时会被静默忽略的话，人工会以为自己只重跑了一个
+    岗位，实际上什么都没发生。必须报错而不是装作成功。"""
+    monkeypatch.setenv("JOBSTAR_DB_PATH", str(tmp_path / "t.db"))
+    _stub_score_pipeline(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["score", "--job-id", "abc123"])
+    assert exc.value.code == 2
+    assert "--job-id 必须配合 --rescore 使用" in capsys.readouterr().err

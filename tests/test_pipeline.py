@@ -3,10 +3,11 @@ import json
 import pytest
 
 from jobstar.actions import PENDING, list_by_status
-from jobstar.config import set_setting
+from jobstar.config import get_setting, set_setting
 from jobstar.db import get_conn, init_db
 from jobstar.models import DimensionScore, JobRequirements, ScoreResult
 from jobstar.pipeline import (
+    clear_for_rescore,
     maybe_enqueue,
     parse_tags,
     prelim_requirements,
@@ -250,3 +251,221 @@ def test_maybe_enqueue_skips_below_threshold(conn):
     )
     result = ScoreResult("j1", 55.0, (), "v1")
     assert maybe_enqueue(conn, req, result, title="t", company="c") is None
+
+
+# --- Important 4：吸收态与 `jobstar score --rescore` ---
+#
+# run_score 的查询是「从没打过分 + 门禁通过」才入场（scores.job_id IS NULL
+# AND gate_results.passed = 1）。这是正确的默认行为，但也意味着四种状态一旦
+# 写入就再也回不来：scoring_failed、pitch_failed、第二遍门禁刷掉、以及已经
+# 成功打过分的岗位（设计文档 §5.3 的校准循环要求能重跑同一批标注过的岗位，
+# 对照改 prompt/权重前后的一致率）。下面这组测试锁住两件事：不传 --rescore
+# 时行为和以前完全一样（吸收态确实是吸收态），传了之后这四种都能重新入场。
+
+
+def _seed_scorable(conn, job_id: str, *, city: str = "杭州", passed: int = 1) -> None:
+    conn.execute(
+        "INSERT INTO jobs (platform, job_id, title, company, raw_jd, detail_fetched, city) "
+        "VALUES ('boss', ?, '后端开发', 'A公司', 'JD 全文', 1, ?)",
+        (job_id, city),
+    )
+    conn.execute(
+        "INSERT INTO gate_results (job_id, passed) VALUES (?, ?)", (job_id, passed)
+    )
+    conn.commit()
+
+
+def _req(job_id: str, city: str = "杭州") -> JobRequirements:
+    return JobRequirements(
+        job_id, city, None, None, None, None, None, (), None, None, None
+    )
+
+
+def test_scoring_failure_is_absorbing_until_rescore_clears_it(conn, monkeypatch):
+    """一次 LLM 抽风不该把岗位永久烧掉——但也不该自动重试（那会把一个真正
+    坏掉的 JD 变成每轮都烧 token 的无限循环）。重新入场必须是人工显式动作。"""
+    from jobstar.llm import LLMSchemaError
+
+    _seed_scorable(conn, "j1")
+    calls: list[str] = []
+
+    def flaky_normalize(**kwargs):
+        calls.append(kwargs["job_id"])
+        if len(calls) == 1:
+            raise LLMSchemaError("重试一次后仍不是合法 JSON")
+        return _req(kwargs["job_id"])
+
+    monkeypatch.setattr("jobstar.pipeline.normalize", flaky_normalize)
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 80.0, (), "v1"),
+    )
+
+    assert run_score(conn).failed == 1
+    assert conn.execute(
+        "SELECT status FROM jobs WHERE job_id='j1'"
+    ).fetchone()["status"] == "scoring_failed"
+
+    again = run_score(conn)
+    assert (again.scored, again.failed) == (0, 0), "不传 --rescore 就不该重新入场"
+    assert calls == ["j1"], "第二轮根本不该再调用一次归一化"
+
+    assert clear_for_rescore(conn) == 1
+    assert run_score(conn).scored == 1
+    assert calls == ["j1", "j1"]
+    assert conn.execute(
+        "SELECT status FROM jobs WHERE job_id='j1'"
+    ).fetchone()["status"] == "scored"
+
+
+def test_rescore_reopens_pitch_failed_job(conn, monkeypatch):
+    """话术生成失败时分数是真的（total 不为 NULL），但 scores 行的存在同样
+    把岗位挡在 run_score 之外。--rescore 要能把它放回来。"""
+    from jobstar.llm import LLMBackendError
+
+    set_setting(conn, "score_threshold", 70)
+    _seed_scorable(conn, "j1")
+    monkeypatch.setattr("jobstar.pipeline.normalize", lambda **kw: _req(kw["job_id"]))
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 80.0, (), "v1"),
+    )
+
+    pitch_calls: list[int] = []
+
+    def flaky_pitch(**kwargs):
+        pitch_calls.append(1)
+        if len(pitch_calls) == 1:
+            raise LLMBackendError("网关 502")
+        return "定制开场白"
+
+    monkeypatch.setattr("jobstar.pipeline.write_pitch", flaky_pitch)
+
+    assert run_score(conn).pitch_failed == 1
+    row = conn.execute("SELECT * FROM scores WHERE job_id='j1'").fetchone()
+    assert row["total"] == 80.0, "分数本身是成立的，不该被话术失败抹掉"
+    assert row["error"] is not None
+
+    assert run_score(conn).scored == 0, "scores 行的存在把它挡在门外"
+
+    assert clear_for_rescore(conn) == 1
+    report = run_score(conn)
+    assert (report.scored, report.enqueued) == (1, 1)
+    assert conn.execute(
+        "SELECT error FROM scores WHERE job_id='j1'"
+    ).fetchone()["error"] is None
+
+
+def test_rescore_restores_second_pass_gate_rejection(conn, monkeypatch):
+    """第二遍门禁把同一行 gate_results 覆盖成 passed=0，此后 run_score 的
+    JOIN 永远选不中它——哪怕人工后来把 city_whitelist 放宽了。"""
+    _seed_scorable(conn, "j1", city="北京")
+    monkeypatch.setattr(
+        "jobstar.pipeline.normalize", lambda **kw: _req(kw["job_id"], city="北京")
+    )
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 80.0, (), "v1"),
+    )
+
+    assert run_score(conn).gated_out == 1
+    assert conn.execute(
+        "SELECT passed FROM gate_results WHERE job_id='j1'"
+    ).fetchone()["passed"] == 0
+    assert run_score(conn).gated_out == 0, "已经被刷掉的岗位不会再被门禁看见"
+
+    # 人工放宽规则后重跑
+    set_setting(
+        conn,
+        "gate_rules",
+        {**get_setting(conn, "gate_rules"), "city_whitelist": ["杭州", "北京"]},
+    )
+    assert clear_for_rescore(conn) == 1
+    assert run_score(conn).scored == 1
+
+
+def test_rescore_leaves_never_scored_and_prefilter_rejects_alone(conn):
+    """只清「确实卡在吸收态」的岗位：
+      - 还没打过分、门禁通过的岗位本来就能入场，不该被动（status 也不能被
+        改回 'new' 之外的值覆盖掉）；
+      - 第一遍门禁刷掉、从没抓过详情页的岗位（detail_fetched=0）够不着
+        run_score，这里也不该去动它——那会让它伪装成一个等待打分的岗位。
+    """
+    _seed_scorable(conn, "fresh")  # 门禁通过、没有 scores 行
+    conn.execute(
+        "INSERT INTO jobs (platform, job_id, title, company, detail_fetched, status) "
+        "VALUES ('boss', 'prefiltered', 't', 'c', 0, 'gated_out')"
+    )
+    conn.execute(
+        "INSERT INTO gate_results (job_id, passed, reject_reason) "
+        "VALUES ('prefiltered', 0, '城市不在白名单：北京')"
+    )
+    conn.commit()
+
+    assert clear_for_rescore(conn) == 0
+
+    row = conn.execute("SELECT * FROM gate_results WHERE job_id='prefiltered'").fetchone()
+    assert row["passed"] == 0
+    assert row["reject_reason"] == "城市不在白名单：北京"
+    assert conn.execute(
+        "SELECT status FROM jobs WHERE job_id='prefiltered'"
+    ).fetchone()["status"] == "gated_out"
+
+
+def test_rescore_with_job_id_only_touches_that_job(conn, monkeypatch):
+    from jobstar.llm import LLMSchemaError
+
+    for job_id in ("j1", "j2"):
+        _seed_scorable(conn, job_id)
+
+    def boom(**kwargs):
+        raise LLMSchemaError("坏了")
+
+    monkeypatch.setattr("jobstar.pipeline.normalize", boom)
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    assert run_score(conn).failed == 2
+
+    assert clear_for_rescore(conn, job_id="j1") == 1
+    assert conn.execute("SELECT COUNT(*) AS n FROM scores").fetchone()["n"] == 1
+    assert conn.execute(
+        "SELECT job_id FROM scores"
+    ).fetchone()["job_id"] == "j2", "只该清掉点名的那一个"
+
+
+def test_rescore_does_not_resurrect_or_duplicate_an_existing_action(conn, monkeypatch):
+    """校准用途（§5.3）要求能重跑已经成功打过分的岗位——包括已经发出过
+    招呼的。actions 的 UNIQUE(type, job_id) + enqueue 的 DO NOTHING 保证
+    重跑不会造出第二条动作、也不会把一条已经 sent 的动作打回待确认，
+    否则一次校准重跑就会给同一个真人再发一遍消息。"""
+    from jobstar import actions
+
+    set_setting(conn, "score_threshold", 70)
+    _seed_scorable(conn, "j1")
+    monkeypatch.setattr("jobstar.pipeline.normalize", lambda **kw: _req(kw["job_id"]))
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    monkeypatch.setattr("jobstar.pipeline.write_pitch", lambda **kw: "第一版开场白")
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 80.0, (), "v1"),
+    )
+
+    assert run_score(conn).enqueued == 1
+    action_id = list_by_status(conn, PENDING)[0]["id"]
+    actions.approve(conn, action_id)
+    actions.mark_sending(conn, action_id)
+    actions.mark_sent(conn, action_id)
+
+    # 改了权重/prompt 之后重跑同一批岗位
+    monkeypatch.setattr("jobstar.pipeline.write_pitch", lambda **kw: "第二版开场白")
+    assert clear_for_rescore(conn) == 1
+    assert run_score(conn).scored == 1
+
+    rows = conn.execute("SELECT * FROM actions WHERE job_id='j1'").fetchall()
+    assert len(rows) == 1, "重跑不该造出第二条动作"
+    assert rows[0]["status"] == actions.SENT, "已发出的动作不该被打回待确认"
+    assert json.loads(rows[0]["payload"])["greeting"] == "第一版开场白", (
+        "payload 也不该被新话术覆盖——那会让台账里记的和真正发出去的不一致"
+    )

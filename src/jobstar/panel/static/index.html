@@ -16,12 +16,14 @@
   textarea { width: 100%; min-height: 110px; font: inherit; padding: 8px; box-sizing: border-box; }
   .row { display: flex; gap: 8px; margin-top: 8px; }
   .gap { color: #b35; }
+  code { font-family: ui-monospace, Menlo, monospace; background: #e6e6e6; padding: 1px 5px; border-radius: 4px; }
   .jd { white-space: pre-wrap; max-height: 320px; overflow: auto; background: #fafafa; padding: 10px; border-radius: 6px; }
   label { display: block; margin: 8px 0; }
   label input { width: 320px; }
   h3 { margin: 0 0 10px; }
   @media (prefers-color-scheme: dark) {
     .bar, .jd { background: #222; }
+    code { background: #333; }
     .err { background: #3a1414; color: #f88; }
     .card { border-color: #444; }
     .card.uncertain { background: #2a1414; border-color: #c66; }
@@ -81,10 +83,18 @@ async function bar() {
   let html =
     `今日已发 ${h.sent_today}/${h.daily_limit}，剩余 ${h.remaining_quota}` +
     `（${esc(h.quota_resets_at)} 重置）　|　待确认 ${h.pending}　|　阈值 ${esc(thr)}` +
-    (h.scoring_failed ? `　|　<b class="gap">打分失败 ${h.scoring_failed} 条待人工处理</b>` : "") +
+    // Important 4：这两条横幅以前只说「待人工处理」，但产品里没有任何入口——
+    // 打分失败的岗位在 run_score 眼里是吸收态（scores 行一旦存在就永远选不
+    // 中它），人工看着数字却无处可点。现在把真正的入口（命令行）直接写在
+    // 横幅里。不做成面板按钮：重跑要走归一化 + 打分两轮 LLM 调用，几十条
+    // 岗位能跑几分钟，塞进一个 HTTP 请求里只会超时，且面板的职责是人工
+    // 确认而不是驱动管道。
+    (h.scoring_failed ? `　|　<b class="gap">打分失败 ${h.scoring_failed} 条</b>` +
+      `<span class="meta">（跑 <code>jobstar score --rescore</code> 重试）</span>` : "") +
     // Minor 3：话术生成失败——分数是真的、只是没能写出话术——单独一条计数，
     // 不和上面"打分失败"混在一起（那会让人误以为分数本身不可信）。
-    (h.pitch_failed ? `　|　<b class="gap">话术生成失败 ${h.pitch_failed} 条待人工处理</b>` : "") +
+    (h.pitch_failed ? `　|　<b class="gap">话术生成失败 ${h.pitch_failed} 条</b>` +
+      `<span class="meta">（跑 <code>jobstar score --rescore</code> 重试）</span>` : "") +
     (h.uncertain ? `　|　<b class="gap">发送结果不确定 ${h.uncertain} 条，请到 Boss 对话列表人工核实</b>` : "") +
     // Minor 5：另一种 sending——认领之后、真正发送之前被打断，error 是空的。
     // 这类行以前在任何视图里都看不到，这里和"发送结果不确定"分开措辞，
