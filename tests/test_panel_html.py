@@ -16,6 +16,7 @@ Important 1（输出转义）和 Important 4（失败横幅要给出入口）的
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from html.parser import HTMLParser
@@ -160,64 +161,121 @@ def test_every_single_quoted_attribute_in_the_panel_goes_through_esc():
     assert not offenders, "单引号属性里有未经 esc() 的插值：\n" + "\n".join(offenders)
 
 
-def _ternary_branch(count_field: str) -> str:
-    """把 `(h.xxx ? ... : "")` 这一整个三元分支的文本取出来。
+RESCORE_CONTROL = "重跑吸收态"
 
-    用固定字符数开窗是不行的：两条失败横幅紧挨着，`h.scoring_failed` 的窗口
-    会滑进 `h.pitch_failed` 的分支里，于是删掉前者的命令文案、断言照样能被
-    后者的文案满足。这里从分支开头一直取到它自己的 `: "")`。
+
+def _banner_branch(count_field: str) -> str:
+    """把某个失败计数对应的那一条横幅分支取出来。
+
+    不能用固定字符数开窗：两条失败横幅紧挨着，`h.scoring_failed` 的窗口会
+    滑进 `h.pitch_failed` 的分支里，于是删掉前者的文案、断言照样能被后者
+    满足（这个错误真的犯过）。这里从 `if (h.xxx)` 一直取到这条 push 的结尾。
     """
-    start = HTML.find(f"({count_field} ?")
+    start = HTML.find(f"if ({count_field})")
     assert start != -1, f"横幅里找不到 {count_field} 的分支"
-    end = HTML.find(': "")', start)
-    assert end != -1, f"{count_field} 的三元分支没有找到结尾"
+    end = HTML.find("]);", start)
+    assert end != -1, f"{count_field} 的分支没有找到结尾"
     return HTML[start:end]
 
 
 @pytest.mark.parametrize("count_field", ["h.scoring_failed", "h.pitch_failed"])
-def test_failure_banners_name_the_command_that_reopens_the_jobs(count_field):
+def test_failure_banners_point_at_a_control_that_reopens_the_jobs(count_field):
     """Important 4：横幅上的「打分失败 N 条」以前是条死路——run_score 永远
-    不会再看这些岗位，面板上也没有入口。计数和重新入场的办法必须一起出现，
-    否则这条提示只是在通知一个人工无法处理的事实。"""
-    branch = _ternary_branch(count_field)
+    不会再看这些岗位（scores 行一旦存在就永远选不中它），面板上也没有任何
+    入口。计数和重新入场的办法必须一起出现，否则这条提示只是在通知一个
+    人工无法处理的事实。"""
+    branch = _banner_branch(count_field)
     assert count_field in branch
-    assert "jobstar score --rescore" in branch, (
-        f"{count_field} 的横幅没有给出重新入场的命令"
-    )
+    assert RESCORE_CONTROL in branch, f"{count_field} 的横幅没有指向重新入场的入口"
 
 
-def test_ternary_branch_helper_does_not_bleed_into_its_neighbour():
-    """上面那条断言靠 _ternary_branch 精确切分。如果切分又滑进隔壁分支，
-    两条断言会同时被同一段文案满足，删掉其中一条的命令也测不出来。"""
-    scoring = _ternary_branch("h.scoring_failed")
+def test_banner_branch_helper_does_not_bleed_into_its_neighbour():
+    """上面那条断言靠 _banner_branch 精确切分。如果切分又滑进隔壁分支，
+    两条断言会被同一段文案满足，删掉其中一条的指引也测不出来。"""
+    scoring = _banner_branch("h.scoring_failed")
     assert "h.pitch_failed" not in scoring
-    assert scoring.count("jobstar score --rescore") == 1
+    assert scoring.count(RESCORE_CONTROL) == 1
+
+
+def test_the_control_the_banner_points_at_actually_exists():
+    """横幅指向「采集与打分」页的重跑开关。那个开关必须真的在页面上——
+    指向一个不存在的入口，和当初完全没有入口是一样的死路。"""
+    assert HTML.count(RESCORE_CONTROL) >= 3, (
+        f"「{RESCORE_CONTROL}」应当出现在两条横幅和采集页的那个勾选项上"
+    )
+    collect_view = HTML[HTML.index("async function renderCollect()") :]
+    collect_view = collect_view[: collect_view.index("\nfunction drawTags()")]
+    assert 'id="rescore"' in collect_view, "采集页上没有重跑开关"
+    assert RESCORE_CONTROL in collect_view, "重跑开关没有用横幅里提到的那个名字"
+    assert 'id="go-score"' in collect_view, "采集页上没有开始打分的按钮"
 
 
 # 允许不经过 esc()/safeHref() 的插值。每一条都要能说清「为什么这个值不可能
 # 是攻击者控制的字符串」——不是「看起来像数字」，而是产品代码保证它是数字。
 # 加新条目意味着你要为它给出同样强度的理由。
+#
+# 除了这份名单，扫描器还认两条规则（见 _is_safe_expression）：
+#   1. 变量名以 Html 结尾 = 约定它装的已经是转义过的 HTML 片段；
+#   2. 三元表达式的两个分支都是字面量 = 输出与数据无关。
 UNESCAPED_ALLOWLIST = {
-    # /api/health 的计数：COUNT(*) 或 len()，见 panel/app.py:health
-    "h.sent_today", "h.remaining_quota", "h.pending", "h.scoring_failed",
-    "h.pitch_failed", "h.uncertain", "h.interrupted",
-    # daily_greeting_limit 是配置项，写入时 validate_setting_value 强制
-    # 「非负整数」（config.py），不可能是字符串
-    "h.daily_limit",
-    # actions.id：SQLite INTEGER PRIMARY KEY
-    "row.action_id", "i.action_id",
-    # scores.total / DimensionScore.score：打分器算出来的数字
-    'i.total ?? "-"', "j.total", "dim.score",
-    # /api/threshold 返回的统计量，全部由 _stats() 用 min/max/sum 算出
-    "t.labeled_total", "g.count", "g.min", "g.max", "g.mean",
-    "f(t.would_apply)", "f(t.would_not_apply)",
-    't.scores_yes.join(", ") || "无"', 't.scores_no.join(", ") || "无"',
-    # 本地拼好的 HTML 片段，内部的值已经各自转义过
-    "noteHtml",
+    # 只做算术，不碰任何外部数据：百分比宽度、本地生成的 id 后缀
+    "(x / total * 100).toFixed(1)",
+    "Date.now().toString(36)",
 }
 
-# 这些插值不产生 HTML：URL 路径片段和 alert() 的纯文本参数。
-NON_HTML_SINKS = ("await api(`/api/", "alert(`")
+# 这些调用的参数不是 HTML：URL 路径片段，以及 showError/showOk 的纯文本
+# 参数——那两个函数自己会 esc()，在这里重复转义反而会把 & 显示成 &amp;。
+NON_HTML_SINKS = (
+    "api(`/api/",
+    "send(`/api/",
+    "showError(`",
+    "showOk(`",
+    "alert(`",
+)
+
+# 本文件的命名约定：以 Html 结尾的变量/函数，装的（返回的）已经是转义过的
+# HTML 片段。约定比白名单好——白名单只能列出今天存在的表达式，约定能让
+# 将来新写的片段自动落在同一条规则下，而且名字本身就是给读代码的人看的。
+_HTML_VAR = re.compile(r"^[A-Za-z_$][\w$]*Html(?:\(.*\))?$")
+_LITERAL = re.compile(r"""^(?:"[^"$]*"|'[^'$]*'|`[^`$]*`)$""")
+
+
+def _ternary_branches_are_literal(expr: str) -> bool:
+    """`cond ? "a" : ""` 这种：输出只可能是两个写死的字面量之一，和数据无关。
+
+    条件里出现什么都不要紧（`s === c.strength ? "selected" : ""` 里的
+    `c.strength` 只参与比较，不进入输出）。两个分支必须都是不含 `${` 的
+    字面量——只要有一个分支会插值，就说明有数据要流出去，不能放行。
+    """
+    depth = 0
+    for i, ch in enumerate(expr):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "?" and depth == 0 and expr[i : i + 2] != "??":
+            rest = expr[i + 1 :]
+            # 分支里的冒号只可能出现在字面量里（这个文件里没有嵌套三元）
+            head, sep, tail = rest.partition('" : ')
+            if not sep:
+                head, sep, tail = rest.partition("` : ")
+            if not sep:
+                head, sep, tail = rest.rpartition(" : ")
+                if not sep:
+                    return False
+            else:
+                head += '"' if '" : ' in rest else "`"
+            return bool(_LITERAL.match(head.strip()) and _LITERAL.match(tail.strip()))
+    return False
+
+
+def _is_safe_expression(expr: str) -> bool:
+    return (
+        expr.startswith(("esc(", "safeHref("))
+        or expr in UNESCAPED_ALLOWLIST
+        or bool(_HTML_VAR.match(expr))
+        or _ternary_branches_are_literal(expr)
+    )
 
 
 def _leaf_interpolations(line: str) -> list[str]:
@@ -259,7 +317,7 @@ def test_every_interpolation_that_reaches_innerhtml_is_escaped():
         if line.strip().startswith("//") or any(s in line for s in NON_HTML_SINKS):
             continue
         for expr in _leaf_interpolations(line):
-            if expr.startswith(("esc(", "safeHref(")) or expr in UNESCAPED_ALLOWLIST:
+            if _is_safe_expression(expr):
                 continue
             offenders.append(f"{INDEX.name}:{lineno}: ${{{expr}}}")
     assert not offenders, (
@@ -297,3 +355,24 @@ def test_action_handlers_report_errors_after_rerendering_not_before():
         "这些处理器先报错再 render()，错误横幅会被 clearError() 抹掉：\n"
         + "\n".join(offenders)
     )
+
+
+def _script_source() -> str:
+    """把 index.html 里那段内联 <script> 抠出来。"""
+    start = HTML.index("<script>") + len("<script>")
+    return HTML[start : HTML.index("</script>", start)]
+
+
+@requires_node
+def test_panel_javascript_parses():
+    """面板的全部逻辑都在一段内联 <script> 里。里面出现语法错误时，浏览器
+    会静默地什么都不执行——页面变成一块空白，控制台之外没有任何提示，而
+    所有 Python 测试照样全绿。这条用 node 做一次纯语法检查，把那类整页
+    失效的改动挡在提交之前。"""
+    proc = subprocess.run(
+        ["node", "--check", "-"],
+        input=_script_source(),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"面板 JS 语法错误：\n{proc.stderr}"

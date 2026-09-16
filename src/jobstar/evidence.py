@@ -72,10 +72,17 @@ def _build_card(raw: dict[str, Any], index: int) -> CapabilityCard:
     return CapabilityCard(**fields)
 
 
-def load_cards(path: Path) -> tuple[CapabilityCard, ...]:
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+def validate_cards(data: Any) -> tuple[CapabilityCard, ...]:
+    """把「YAML 解析出来的东西」校验成卡片元组。
+
+    从 `load_cards` 里拆出来，好让面板的卡片编辑器在**写盘之前**跑同一套
+    校验——两条路径必须共用一份规则，否则从面板存进去的卡片可能是下次
+    启动时才炸的坏数据。
+    """
     if not isinstance(data, list):
-        raise CardValidationError(f"{path} 顶层必须是列表，实际是 {type(data).__name__}")
+        raise CardValidationError(f"顶层必须是列表，实际是 {type(data).__name__}")
+    if not data:
+        raise CardValidationError("卡片库是空的——打分器会把每个维度都判 0 分")
     cards = tuple(_build_card(raw, i) for i, raw in enumerate(data))
     seen: set[str] = set()
     for card in cards:
@@ -83,6 +90,40 @@ def load_cards(path: Path) -> tuple[CapabilityCard, ...]:
             raise CardValidationError(f"卡片 id 重复：{card.id}")
         seen.add(card.id)
     return cards
+
+
+def load_cards(path: Path) -> tuple[CapabilityCard, ...]:
+    try:
+        return validate_cards(yaml.safe_load(Path(path).read_text(encoding="utf-8")))
+    except CardValidationError as exc:
+        # 带上文件路径——面板和 CLI 都可能指向不同的卡片库
+        raise CardValidationError(f"{path}: {exc}") from exc
+
+
+def card_to_raw(card: CapabilityCard) -> dict[str, Any]:
+    """卡片 -> 中文键的映射，键序和 _KEY_MAP 一致（也就是文件里的书写顺序）。"""
+    raw: dict[str, Any] = {}
+    for cn_key, field in _KEY_MAP.items():
+        value = getattr(card, field)
+        if field in _TUPLE_FIELDS:
+            raw[cn_key] = list(value)
+        elif field == "strength":
+            raw[cn_key] = value.value
+        else:
+            raw[cn_key] = value
+    return raw
+
+
+def dump_cards(cards: tuple[CapabilityCard, ...]) -> str:
+    """序列化回 YAML。`allow_unicode` 必须开——否则中文全被转义成 \\uXXXX，
+    这份文件就再也不能由本人手工校对了，而手工校对正是它存在的理由。"""
+    return yaml.safe_dump(
+        [card_to_raw(c) for c in cards],
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=None,
+        width=100,
+    )
 
 
 @dataclass(frozen=True)

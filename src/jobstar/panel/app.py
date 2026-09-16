@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
@@ -21,8 +23,14 @@ from jobstar.config import (
     set_setting,
 )
 from jobstar.db import get_conn, init_db
-from jobstar.evidence import load_cards
+from jobstar.evidence import (
+    CardValidationError,
+    dump_cards,
+    load_cards,
+    validate_cards,
+)
 from jobstar.models import DIMENSION_LABELS
+from jobstar.panel.runner import RUNNER, AlreadyRunning, TaskRunner
 
 STATIC = Path(__file__).parent / "static"
 
@@ -483,6 +491,266 @@ def threshold(conn: sqlite3.Connection = Depends(get_db)) -> dict:
 @app.get("/api/settings")
 def read_settings(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     return {key: get_setting(conn, key) for key in SETTING_DEFAULTS}
+
+
+# --- 能力卡片编辑器 ---------------------------------------------------------
+#
+# 这份文件（data/capability_cards.yaml）是整套系统防止简历吹牛的唯一防线，
+# 也是唯一一份含个人隐私、被 .gitignore 整目录排除的数据。面板改它的三条
+# 纪律：写盘前跑和启动时同一套校验；每次覆盖前留一份带时间戳的备份；写入
+# 用临时文件 + 原子替换，中途失败不会留下一个半截的卡片库。
+
+
+def _cards_dir_backup(path: Path) -> Path:
+    backups = path.parent / "card-backups"
+    backups.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return backups / f"{path.stem}-{stamp}{path.suffix}"
+
+
+@app.get("/api/cards")
+def read_cards() -> dict:
+    """卡片库当前内容。文件坏掉时不抛 500，而是把错误交给前端显示——
+    否则人工会卡在一个「打不开也修不了」的死角里。前端在 error 非空时
+    会禁用保存按钮，避免用一个空列表把 40 张卡片覆盖掉。"""
+    path = get_settings().cards_path
+    try:
+        cards = load_cards(path)
+    except (CardValidationError, OSError, yaml.YAMLError) as exc:
+        return {"path": str(path), "cards": [], "error": str(exc)}
+    return {
+        "path": str(path),
+        "error": None,
+        "cards": [
+            {
+                "id": c.id,
+                "capability": c.capability,
+                "synonyms": list(c.synonyms),
+                "strength": c.strength.value,
+                "project": c.project,
+                "metrics": list(c.metrics),
+                "depth": c.depth,
+                "resume_versions": list(c.resume_versions),
+            }
+            for c in cards
+        ],
+    }
+
+
+@app.put("/api/cards", dependencies=[Depends(require_panel_request)])
+def write_cards(body: dict = Body(...), conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    incoming = body.get("cards")
+    if not isinstance(incoming, list):
+        raise HTTPException(400, "cards 必须是列表")
+
+    # 前端送的是 ASCII 字段名，文件里是中文键——换回来，顺便把「这一张卡片
+    # 的哪个字段不对」的定位留给 evidence 那套既有校验。
+    raw = []
+    for i, card in enumerate(incoming):
+        if not isinstance(card, dict):
+            raise HTTPException(400, f"第 {i + 1} 张卡片不是对象")
+        raw.append(
+            {
+                cn: card.get(field)
+                for cn, field in (
+                    ("id", "id"),
+                    ("能力", "capability"),
+                    ("同义表述", "synonyms"),
+                    ("证据强度", "strength"),
+                    ("项目", "project"),
+                    ("可量化", "metrics"),
+                    ("可讲深度", "depth"),
+                    ("关联简历版本", "resume_versions"),
+                )
+            }
+        )
+    try:
+        cards = validate_cards(raw)
+    except CardValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    path = get_settings().cards_path
+    text = dump_cards(cards)
+    try:
+        if path.exists():
+            shutil.copy2(path, _cards_dir_backup(path))
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)  # 同目录内的原子替换
+    except OSError as exc:
+        raise HTTPException(500, f"写入卡片库失败：{exc}") from exc
+
+    strong = sum(1 for c in cards if c.strength.value == "强")
+    return {"ok": True, "count": len(cards), "strong": strong}
+
+
+# --- 面板触发的采集 / 打分 ---------------------------------------------------
+
+
+def get_runner() -> TaskRunner:
+    """后台任务运行器。做成依赖而不是直接引用模块级单例，是为了让测试能
+    用 `app.dependency_overrides` 换成一个干净实例——共用单例的话，前一个
+    测试留下的状态会让后一个测试收到 409。"""
+    return RUNNER
+
+
+@app.get("/api/run/status")
+def run_status(runner: TaskRunner = Depends(get_runner)) -> dict:
+    return {"task": runner.snapshot()}
+
+
+def _busy(exc: AlreadyRunning) -> HTTPException:
+    return HTTPException(409, str(exc))
+
+
+@app.post("/api/run/collect", dependencies=[Depends(require_panel_request)])
+def run_collect_task(
+    body: dict = Body(...),
+    conn: sqlite3.Connection = Depends(get_db),
+    runner: TaskRunner = Depends(get_runner),
+) -> dict:
+    keywords = [
+        k.strip() for k in (body.get("keywords") or []) if isinstance(k, str) and k.strip()
+    ]
+    if not keywords:
+        raise HTTPException(400, "至少要填一个搜索关键词")
+    city = str(body.get("city") or "").strip()
+    if not city.isdigit():
+        raise HTTPException(400, "城市码必须是数字（Boss 的 city code，杭州是 101210100）")
+    raw_pages = body.get("pages")
+    try:
+        # 不能写 `body.get("pages") or 1`：0 是假值，会被悄悄当成 1——
+        # 人工填了个非法值，系统却装作他填的是 1。只有「没填」才用默认值。
+        pages = 1 if raw_pages is None else int(raw_pages)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "页数必须是整数") from exc
+    if not 1 <= pages <= 10:
+        raise HTTPException(400, "页数只能是 1-10")
+
+    # 记住这次的搜索条件，下次打开面板直接预填
+    set_setting(conn, "last_search", {"keywords": keywords, "city": city, "pages": pages})
+
+    label = f"{keywords[0]} 等 {len(keywords)} 个关键词" if len(keywords) > 1 else keywords[0]
+
+    def work(note):
+        from jobstar.collector.boss import LoginRequired
+        from jobstar.pipeline import run_collect
+
+        task_conn = get_conn(get_settings().db_path)
+        totals = {"listed": 0, "new": 0, "gated_out": 0, "detail_fetched": 0, "errors": []}
+        try:
+            for keyword in keywords:
+                note(f"▶ 开始采集「{keyword}」（{pages} 页）")
+                try:
+                    report = run_collect(
+                        task_conn,
+                        keyword=keyword,
+                        city_code=city,
+                        pages=pages,
+                        on_progress=note,
+                    )
+                except LoginRequired as exc:
+                    # 登录态失效是会话级硬故障：剩下的关键词再跑也只是拿一个
+                    # 已经失效的会话反复撞墙。整轮中止，写进健康状态让横幅显示。
+                    set_setting(
+                        task_conn, "last_collect_error", f"Boss 登录态失效，采集已中止：{exc}"
+                    )
+                    set_setting(task_conn, "last_collect_at", _stamp())
+                    raise RuntimeError(
+                        f"Boss 登录态失效，采集已中止：{exc}。"
+                        "请在 Chrome 里重新扫码登录后再试"
+                    ) from exc
+                for key in ("listed", "new", "gated_out", "detail_fetched"):
+                    totals[key] += getattr(report, key)
+                totals["errors"].extend(report.errors)
+            _record_collect_health(task_conn, totals)
+            return totals
+        finally:
+            task_conn.close()
+
+    try:
+        return {"task": runner.start("collect", label, work)}
+    except AlreadyRunning as exc:
+        raise _busy(exc) from exc
+
+
+@app.post("/api/run/score", dependencies=[Depends(require_panel_request)])
+def run_score_task(
+    body: dict = Body(default={}),
+    runner: TaskRunner = Depends(get_runner),
+) -> dict:
+    rescore = bool(body.get("rescore"))
+    limit = body.get("limit")
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "条数上限必须是整数") from exc
+        if limit < 1:
+            raise HTTPException(400, "条数上限至少是 1")
+
+    def work(note):
+        from jobstar.pipeline import clear_for_rescore, run_score
+
+        task_conn = get_conn(get_settings().db_path)
+        try:
+            if rescore:
+                cleared = clear_for_rescore(task_conn)
+                note(
+                    f"已清除 {cleared} 个岗位的吸收态"
+                    "（打分失败／话术失败／第二遍门禁刷掉／已打过分）"
+                )
+                if cleared == 0:
+                    note("没有岗位处于吸收态——这一轮和不勾「重跑」完全一样")
+            report = run_score(task_conn, limit=limit, on_progress=note)
+            return {
+                "scored": report.scored,
+                "gated_out": report.gated_out,
+                "failed": report.failed,
+                "pitch_failed": report.pitch_failed,
+                "enqueued": report.enqueued,
+                "already_queued": report.already_queued,
+                "retracted": report.retracted,
+                "errors": report.errors,
+            }
+        finally:
+            task_conn.close()
+
+    try:
+        return {"task": runner.start("score", "重跑打分" if rescore else "打分", work)}
+    except AlreadyRunning as exc:
+        raise _busy(exc) from exc
+
+
+def _stamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _record_collect_health(conn: sqlite3.Connection, totals: dict) -> None:
+    """和 CLI 的 collect 写同一套健康状态，横幅才认得（见 cli.py 的注释）。
+
+    last_collect_at 记「最近一次尝试」，成功失败都前进；last_collect_ok_at
+    只在真正干净的那次前进——两者不相等时横幅就不能宣称「未见异常」。
+    """
+    now = _stamp()
+    if totals["listed"] == 0 and totals["errors"]:
+        set_setting(
+            conn,
+            "last_collect_error",
+            "本次没有抓到任何列表条目——可能是关键词真的零匹配，"
+            "也可能是页面被拦截，无法自动区分，请人工核实",
+        )
+    elif totals["errors"]:
+        set_setting(
+            conn,
+            "last_collect_error",
+            f"{len(totals['errors'])} 个岗位抓取失败（可能是页面结构变更）："
+            + "；".join(totals["errors"][:3]),
+        )
+    else:
+        set_setting(conn, "last_collect_error", None)
+        set_setting(conn, "last_collect_ok_at", now)
+    set_setting(conn, "last_collect_at", now)
 
 
 @app.put("/api/settings", dependencies=[Depends(require_panel_request)])

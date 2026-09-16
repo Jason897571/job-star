@@ -123,11 +123,19 @@ def run_collect(
     pages: int = 1,
     fetch_fn: Callable[..., list[dict]] | None = None,
     detail_fn: Callable[[str], dict] | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> CollectReport:
+    """`on_progress` 每处理完一个岗位调用一次，给面板做进度条用。
+
+    一轮采集要开真实浏览器逐条抓详情页，几分钟起步；没有逐条进度的话，
+    面板上就是一个几分钟不动、分不清「在跑」和「卡死」的转圈。CLI 不传
+    这个参数，行为完全不变。
+    """
     from jobstar.collector import boss
 
     fetch_fn = fetch_fn or boss.fetch_list
     detail_fn = detail_fn or boss.fetch_detail
+    note = on_progress or (lambda _: None)
 
     report = CollectReport()
     try:
@@ -142,6 +150,7 @@ def run_collect(
 
     report.listed = len(items)
     report.new = boss.save_jobs(conn, items)
+    note(f"「{keyword}」列表 {report.listed} 条，新增 {report.new} 条")
 
     rules = _gate_rules(conn)
 
@@ -156,6 +165,7 @@ def run_collect(
         result = gate.check(req, rules, company=row["company"] or "")
         gate.save_result(conn, row["job_id"], result)
         if not result.passed:
+            note(f"预门禁刷掉：{row['title']}（{result.reject_reason}）")
             report.gated_out += 1
             conn.execute(
                 "UPDATE jobs SET status='gated_out' WHERE job_id=?", (row["job_id"],)
@@ -172,10 +182,12 @@ def run_collect(
             # 立刻能看懂的“重新登录再跑”信号。让它照原样往外炸穿。
             raise
         except Exception as exc:
+            note(f"详情页抓取失败：{row['title']}（{exc}）")
             report.errors.append(f"{row['job_id']}: {exc}")
             continue
         boss.save_detail(conn, row["job_id"], detail)
         report.detail_fetched += 1
+        note(f"已抓详情：{row['title']} · {row['company']}")
 
     return report
 
@@ -352,14 +364,19 @@ def run_score(
     *,
     limit: int | None = None,
     job_id: str | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> ScoreReport:
     """对已抓详情、已过第一遍门禁、还没打过分的岗位做归一化 + 门禁 + 打分。
 
     `job_id` 只处理这一个岗位。`clear_for_rescore` 有同名参数，两者必须一起
     传——只限定清场范围而让打分全库跑，等于对着一堆人工没点名的岗位调 LLM
     写话术、生成待确认动作，而命令行还在说「只重跑这一个」。
+
+    `on_progress` 每处理完一个岗位调用一次（每个岗位两轮 LLM 调用，几十条
+    就是几分钟），给面板做进度条用。CLI 不传，行为完全不变。
     """
     report = ScoreReport()
+    note = on_progress or (lambda _: None)
     sql = (
         "SELECT j.* FROM jobs j "
         "JOIN gate_results g ON g.job_id = j.job_id AND g.passed = 1 "
@@ -371,6 +388,7 @@ def run_score(
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
     rows = conn.execute(sql, (job_id, job_id)).fetchall()
+    note(f"待处理 {len(rows)} 个岗位")
 
     cards = load_cards(get_settings().cards_path)
     weights = get_setting(conn, "dimension_weights")
@@ -386,6 +404,7 @@ def run_score(
                 salary_hint=row["salary_raw"],
             )
         except (LLMSchemaError, LLMBackendError) as exc:
+            note(f"归一化失败：{row['title']}（{exc}）")
             save_failure(conn, row["job_id"], f"归一化失败：{exc}")
             report.failed += 1
             report.errors.append(f"{row['job_id']}: {exc}")
@@ -395,6 +414,7 @@ def run_score(
         gate_result = gate.check(req, rules, company=row["company"] or "")
         gate.save_result(conn, row["job_id"], gate_result)
         if not gate_result.passed:
+            note(f"门禁刷掉：{row['title']}（{gate_result.reject_reason}）")
             report.gated_out += 1
             conn.execute(
                 "UPDATE jobs SET status='gated_out' WHERE job_id=?", (row["job_id"],)
@@ -412,6 +432,7 @@ def run_score(
         try:
             result = score(req, cards, weights)
         except (LLMSchemaError, LLMBackendError) as exc:
+            note(f"打分失败：{row['title']}（{exc}）")
             save_failure(conn, row["job_id"], f"打分失败：{exc}")
             report.failed += 1
             report.errors.append(f"{row['job_id']}: {exc}")
@@ -419,6 +440,7 @@ def run_score(
 
         save_score(conn, result)
         report.scored += 1
+        note(f"{result.total:g} 分 · {row['title']} · {row['company']}")
 
         try:
             qualifies = threshold_reached(conn, result.total)

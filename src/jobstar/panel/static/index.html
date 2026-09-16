@@ -1,44 +1,279 @@
 <!doctype html>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>jobstar 面板</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 15px/1.6 -apple-system, "PingFang SC", sans-serif; margin: 0; padding: 20px; max-width: 900px; }
-  nav button { padding: 6px 14px; margin-right: 6px; cursor: pointer; }
-  nav button.on { font-weight: 700; }
-  .bar { padding: 8px 12px; border-radius: 6px; background: #f2f2f2; margin-bottom: 16px; font-size: 13px; }
-  .err { padding: 8px 12px; border-radius: 6px; background: #fdd; color: #900; margin-bottom: 16px; font-size: 13px; }
-  .err:empty { display: none; }
-  .card { border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin-bottom: 14px; }
-  .card.uncertain { border-color: #b35; background: #fff6f6; }
-  .meta { color: #666; font-size: 13px; }
-  .score { float: right; font-size: 22px; font-weight: 700; }
-  textarea { width: 100%; min-height: 110px; font: inherit; padding: 8px; box-sizing: border-box; }
-  .row { display: flex; gap: 8px; margin-top: 8px; }
-  .gap { color: #b35; }
-  code { font-family: ui-monospace, Menlo, monospace; background: #e6e6e6; padding: 1px 5px; border-radius: 4px; }
-  .jd { white-space: pre-wrap; max-height: 320px; overflow: auto; background: #fafafa; padding: 10px; border-radius: 6px; }
-  label { display: block; margin: 8px 0; }
-  label input { width: 320px; }
-  h3 { margin: 0 0 10px; }
-  @media (prefers-color-scheme: dark) {
-    .bar, .jd { background: #222; }
-    code { background: #333; }
-    .err { background: #3a1414; color: #f88; }
-    .card { border-color: #444; }
-    .card.uncertain { background: #2a1414; border-color: #c66; }
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --surface-2: #fafbfc;
+    --border: #e3e6ea;
+    --text: #1a1d21;
+    --muted: #6b7280;
+    --accent: #4f6bed;
+    --accent-soft: #eef1fd;
+    --warn: #b3541e;
+    --warn-soft: #fdf3ea;
+    --danger: #b3323c;
+    --danger-soft: #fdeff0;
+    --ok: #1f7a4d;
+    --radius: 10px;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .04);
   }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121418;
+      --surface: #1b1e24;
+      --surface-2: #21252c;
+      --border: #2e333c;
+      --text: #e6e8eb;
+      --muted: #949ba7;
+      --accent: #7f93f5;
+      --accent-soft: #23293f;
+      --warn: #e0a26a;
+      --warn-soft: #2e2519;
+      --danger: #ef8a92;
+      --danger-soft: #321f22;
+      --ok: #5cc48d;
+      --shadow: none;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .92em;
+  }
+  code {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    padding: 1px 5px;
+    border-radius: 5px;
+  }
+
+  /* ---- 布局 ---- */
+  .shell { display: grid; grid-template-columns: 196px 1fr; min-height: 100vh; }
+  aside {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 20px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .brand {
+    font-size: 16px; font-weight: 700; letter-spacing: .3px;
+    padding: 0 10px 16px; display: flex; align-items: center; gap: 8px;
+  }
+  .brand small { font-weight: 400; color: var(--muted); font-size: 11px; }
+  nav button {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    width: 100%; text-align: left;
+    padding: 8px 10px; border: 0; border-radius: 8px;
+    background: transparent; color: var(--text);
+    font: inherit; cursor: pointer;
+  }
+  nav button:hover { background: var(--surface-2); }
+  nav button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  nav .tally {
+    font-size: 11px; padding: 1px 7px; border-radius: 999px;
+    background: var(--accent); color: #fff; font-weight: 600;
+  }
+  nav button.on .tally { background: var(--accent); }
+  .side-foot { margin-top: auto; padding: 12px 10px 0; color: var(--muted); font-size: 11px; }
+
+  main { padding: 22px 26px 60px; max-width: 1040px; }
+  h2 { margin: 0 0 4px; font-size: 20px; }
+  .lede { color: var(--muted); margin: 0 0 18px; }
+  h3 { margin: 26px 0 10px; font-size: 14px; color: var(--muted); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .6px; }
+  h3:first-child { margin-top: 0; }
+
+  /* ---- 状态条 ---- */
+  .bar {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 12px 16px; margin-bottom: 16px;
+  }
+  .stats { display: flex; flex-wrap: wrap; gap: 22px; }
+  .stat { display: flex; flex-direction: column; }
+  .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .stat .v { font-size: 17px; font-weight: 650; }
+  .stat .v small { font-size: 12px; font-weight: 400; color: var(--muted); }
+  .notes { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .note {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    font-size: 13px; padding: 7px 11px; border-radius: 8px;
+    background: var(--surface-2); color: var(--muted);
+  }
+  .note.warn { background: var(--warn-soft); color: var(--warn); }
+  .note.bad { background: var(--danger-soft); color: var(--danger); }
+
+  /* ---- 卡片 ---- */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 16px; margin-bottom: 12px;
+  }
+  .card.flag { border-color: var(--danger); background: var(--danger-soft); }
+  .card-head { display: flex; align-items: flex-start; gap: 12px; }
+  .card-head .title { flex: 1; min-width: 0; }
+  .card-head b { font-size: 15px; }
+  .meta { color: var(--muted); font-size: 12.5px; }
+  .meta a { color: var(--accent); text-decoration: none; }
+  .meta a:hover { text-decoration: underline; }
+  .score {
+    font-size: 24px; font-weight: 700; line-height: 1;
+    padding: 6px 12px; border-radius: 8px;
+    background: var(--accent-soft); color: var(--accent);
+  }
+  .jd {
+    white-space: pre-wrap; max-height: 300px; overflow: auto;
+    background: var(--surface-2); border: 1px solid var(--border);
+    padding: 12px; border-radius: 8px; margin-top: 10px; font-size: 13px;
+  }
+  .gap { color: var(--danger); }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+
+  /* ---- 表单 ---- */
+  textarea, input, select {
+    font: inherit; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; width: 100%;
+  }
+  textarea { min-height: 104px; resize: vertical; }
+  textarea:focus, input:focus, select:focus {
+    outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent);
+  }
+  label.field { display: block; margin-bottom: 12px; }
+  label.field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .grid { display: grid; gap: 12px; }
+  .grid.c2 { grid-template-columns: 1fr 1fr; }
+  .grid.c3 { grid-template-columns: 2fr 1fr 1fr; }
+  @media (max-width: 720px) { .grid.c2, .grid.c3 { grid-template-columns: 1fr; } }
+
+  .row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  .row.right { justify-content: flex-end; }
+  button.btn {
+    font: inherit; cursor: pointer; padding: 8px 15px;
+    border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text);
+  }
+  button.btn:hover:not(:disabled) { background: var(--surface-2); }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.btn.primary:hover:not(:disabled) { filter: brightness(1.07); }
+  button.btn.quiet { border-color: transparent; color: var(--muted); }
+  button.btn.danger { color: var(--danger); }
+  button.btn:disabled { opacity: .5; cursor: not-allowed; }
+  .spacer { flex: 1; }
+
+  /* ---- 全局错误 / 提示 ---- */
+  .err, .ok-msg {
+    padding: 11px 14px; border-radius: var(--radius);
+    margin-bottom: 14px; font-size: 13.5px;
+  }
+  .err { background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger); }
+  .ok-msg { background: var(--surface); color: var(--ok); border: 1px solid var(--ok); }
+  .err:empty, .ok-msg:empty { display: none; }
+
+  /* ---- 关键词标签 ---- */
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .tag {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--accent-soft); color: var(--accent);
+    padding: 4px 6px 4px 11px; border-radius: 999px; font-size: 13px;
+  }
+  .tag button {
+    border: 0; background: transparent; color: inherit; cursor: pointer;
+    font-size: 15px; line-height: 1; padding: 0 3px; opacity: .65;
+  }
+  .tag button:hover { opacity: 1; }
+
+  /* ---- 运行日志 ---- */
+  .log {
+    background: #0e1116; color: #cdd6e3;
+    border-radius: 8px; padding: 12px 14px;
+    max-height: 340px; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; line-height: 1.75; white-space: pre-wrap; word-break: break-word;
+  }
+  .log:empty::after { content: "还没有输出"; color: #5b6676; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 3px 11px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  }
+  .pill.running { background: var(--accent-soft); color: var(--accent); }
+  .pill.done { background: var(--surface-2); color: var(--ok); }
+  .pill.failed { background: var(--danger-soft); color: var(--danger); }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+    animation: blink 1.1s ease-in-out infinite;
+  }
+  @keyframes blink { 50% { opacity: .25; } }
+  .floating {
+    position: fixed; right: 20px; bottom: 20px; z-index: 20;
+    background: var(--surface); border: 1px solid var(--border);
+    box-shadow: 0 6px 20px rgba(16, 24, 40, .16);
+    border-radius: 999px; padding: 9px 15px;
+    display: flex; align-items: center; gap: 10px; cursor: pointer;
+  }
+
+  /* ---- 卡片编辑器 ---- */
+  .dist { display: flex; height: 9px; border-radius: 999px; overflow: hidden; margin: 8px 0 4px; }
+  .dist i { display: block; }
+  .dist .s { background: var(--accent); }
+  .dist .m { background: #8fa4f0; }
+  .dist .w { background: var(--border); }
+  .cap {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 8px; overflow: hidden;
+  }
+  .cap > summary {
+    padding: 11px 14px; cursor: pointer; display: flex;
+    align-items: center; gap: 10px; list-style: none;
+  }
+  .cap > summary::-webkit-details-marker { display: none; }
+  .cap > summary:hover { background: var(--surface-2); }
+  .cap .body { padding: 4px 14px 14px; border-top: 1px solid var(--border); }
+  .badge {
+    font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+  }
+  .badge.强 { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .badge.中 { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
 </style>
 
-<nav>
-  <button data-view="queue" class="on">待确认队列</button>
-  <button data-view="label">标注</button>
-  <button data-view="threshold">阈值</button>
-  <button data-view="settings">设置</button>
-</nav>
-<div class="bar" id="bar"></div>
-<div class="err" id="err"></div>
-<div id="main"></div>
+<div class="shell">
+  <aside>
+    <div class="brand">jobstar <small>本地面板</small></div>
+    <nav>
+      <button data-view="queue" class="on">待确认队列<span class="tally" id="t-queue" hidden></span></button>
+      <button data-view="collect">采集与打分</button>
+      <button data-view="cards">能力卡片</button>
+      <button data-view="label">标注</button>
+      <button data-view="threshold">阈值</button>
+      <button data-view="settings">设置</button>
+    </nav>
+    <div class="side-foot">
+      发送仍然只能从命令行执行：<br><code>uv run jobstar send</code>
+    </div>
+  </aside>
+
+  <main>
+    <div class="bar" id="bar"></div>
+    <div class="err" id="err"></div>
+    <div class="ok-msg" id="ok"></div>
+    <div id="main"></div>
+  </main>
+</div>
+<div id="float"></div>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -48,28 +283,32 @@ const $ = (s) => document.querySelector(s);
 // panel/app.py 的 require_panel_request）。
 const api = (p, o) => fetch(p, { ...o, headers: { ...(o && o.headers), "X-Jobstar-Panel": "1" } })
   .then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e)));
+const send = (p, method, body) => api(p, {
+  method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+});
 // Important 1：原来的正则不转义单引号，但设置视图把 esc() 的结果塞进单
 // 引号属性（value='${...}'）。last_collect_error 来自 CollectError 消息里
 // 的 `{data[:300]!r}`——Python 的 repr() 恒用单引号包裹，所以第一次 JSON
 // 解析失败的采集错误就能天然带出一个未转义的单引号，闭合掉属性、在设置
 // 页开一个事件处理器——攻击面已经在系统自己产出的错误文案里，不需要
-// 外部输入。这里补上单引号，连带审计过文件里其余的插值点：其余都是
-// 双引号属性，单引号只出现在设置视图那一处（下面 renderSettings 里）。
+// 外部输入。tests/test_panel_html.py 逐个调用点盯着这件事。
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 
 // Important 6：面板是 §7"不静默失败"唯一的人工入口，却是最容易悄悄吞掉
 // 后端错误的地方——api() 对任何非 2xx 都 reject，调用点一旦没接住，浏览器
 // 只会在 devtools 里留一条没人看的 unhandled rejection，页面本身什么都不
-// 显示。这里放一个跨视图共用的错误横幅：render() 统一 try/catch 兜住四个
-// 视图 + bar() 自身的失败；不经过 render() 的独立操作（清除采集错误、
-// 保存设置、标注、展开分数拆解）各自再包一层，失败时都调用 showError。
+// 显示。这里放一个跨视图共用的错误横幅：render() 统一 try/catch 兜住所有
+// 视图 + bar() 自身的失败；不经过 render() 的独立操作各自再包一层。
 function showError(err) {
   const msg = (err && typeof err === "object" && "detail" in err)
     ? err.detail
     : (err && err.message) || String(err);
   $("#err").innerHTML = `⚠️ ${esc(msg)}`;
+  $("#ok").innerHTML = "";
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
-function clearError() { $("#err").innerHTML = ""; }
+function showOk(msg) { $("#ok").innerHTML = `✓ ${esc(msg)}`; $("#err").innerHTML = ""; }
+function clearError() { $("#err").innerHTML = ""; $("#ok").innerHTML = ""; }
 // url 来自采集器抓取的 <a href>（见 collector/boss.py），不是本系统自己
 // 生成的值——esc() 只挡得住 HTML 转义，挡不住 javascript: 这类协议。这里
 // 只放行 http(s) 链接，否则渲染成 "#"，防止一个被抓到的恶意 href 在人工
@@ -77,57 +316,77 @@ function clearError() { $("#err").innerHTML = ""; }
 const safeHref = (u) => /^https?:\/\//i.test(u || "") ? esc(u) : "#";
 let view = "queue";
 
+/* ==================== 顶部状态条 ==================== */
+
 async function bar() {
   const h = await api("/api/health");
-  const thr = h.score_threshold === null ? "未设（冷启动期，不生成动作）" : h.score_threshold;
-  let html =
-    `今日已发 ${h.sent_today}/${h.daily_limit}，剩余 ${h.remaining_quota}` +
-    `（${esc(h.quota_resets_at)} 重置）　|　待确认 ${h.pending}　|　阈值 ${esc(thr)}` +
-    // Important 4：这两条横幅以前只说「待人工处理」，但产品里没有任何入口——
-    // 打分失败的岗位在 run_score 眼里是吸收态（scores 行一旦存在就永远选不
-    // 中它），人工看着数字却无处可点。现在把真正的入口（命令行）直接写在
-    // 横幅里。不做成面板按钮：重跑要走归一化 + 打分两轮 LLM 调用，几十条
-    // 岗位能跑几分钟，塞进一个 HTTP 请求里只会超时，且面板的职责是人工
-    // 确认而不是驱动管道。
-    (h.scoring_failed ? `　|　<b class="gap">打分失败 ${h.scoring_failed} 条</b>` +
-      `<span class="meta">（跑 <code>jobstar score --rescore</code> 重试）</span>` : "") +
-    // Minor 3：话术生成失败——分数是真的、只是没能写出话术——单独一条计数，
-    // 不和上面"打分失败"混在一起（那会让人误以为分数本身不可信）。
-    (h.pitch_failed ? `　|　<b class="gap">话术生成失败 ${h.pitch_failed} 条</b>` +
-      `<span class="meta">（跑 <code>jobstar score --rescore</code> 重试）</span>` : "") +
-    (h.uncertain ? `　|　<b class="gap">发送结果不确定 ${h.uncertain} 条，请到 Boss 对话列表人工核实</b>` : "") +
-    // Minor 5：另一种 sending——认领之后、真正发送之前被打断，error 是空的。
-    // 这类行以前在任何视图里都看不到，这里和"发送结果不确定"分开措辞，
-    // 因为它连发送按钮点没点到都不确定，不能用同一句话带过。
-    (h.interrupted ? `　|　<b class="gap">发送疑似中断 ${h.interrupted} 条，请到 Boss 对话列表人工核实</b>` : "");
-  // 采集健康状态（Task 13）：被动信号，只反映上一次真的跑过 collect 时
-  // 观察到的结果，不是主动的实时探活——所以措辞里如实带出「上次采集」
-  // 而不是暗示"现在"的状态。last_collect_error 为空时不代表零结果一定是
-  // 真实零匹配：这一层从采集器开始就无法区分"关键词零结果"和"页面被拦截"。
-  //
-  // fix round 1（review finding 1）：last_collect_at 是「最近一次尝试」，
-  // 成功失败都会前进；last_collect_ok_at 只在真正成功时才前进。人工点掉
-  // 错误横幅只清 last_collect_error，不清 last_collect_at——如果这里只看
-  // last_collect_error 是否为空就说「未见异常」，会把刚被点掉的那次失败
-  // 尝试说成是干净的。只有两者相等（最近一次尝试就是最近一次成功）才能
-  // 说「未见异常」；否则如实说「尝试过但没成功」，而不是暗示健康。
+  const thr = h.score_threshold === null ? "未设" : h.score_threshold;
+  const thrHint = h.score_threshold === null ? "冷启动期，不生成动作" : "达到即入队";
+  // 每项的第二个元素是**已经转义好**的 HTML 片段（数字要配 <small> 副标），
+  // 所以变量名按本文件的约定以 Html 结尾——tests/test_panel_html.py 的扫描器
+  // 靠这个约定区分「待转义的数据」和「拼好的片段」。
+  const stats = [
+    ["今日已发", `${esc(h.sent_today)}<small> / ${esc(h.daily_limit)}</small>`, `剩余 ${esc(h.remaining_quota)}，${esc(h.quota_resets_at)} 重置`],
+    ["待确认", esc(h.pending), "等你在队列页逐条过目"],
+    ["入队阈值", esc(thr), thrHint],
+  ];
+  let html = `<div class="stats">` + stats.map(([k, valueHtml, hint]) => `
+      <div class="stat" title="${esc(hint)}">
+        <span class="k">${esc(k)}</span><span class="v">${valueHtml}</span>
+      </div>`).join("") + `</div>`;
+
+  const notes = [];
+  // Important 4：这两条以前只说「待人工处理」，但产品里没有任何入口——
+  // 打分失败的岗位在 run_score 眼里是吸收态（scores 行一旦存在就永远选不
+  // 中它），人工看着数字却无处可点。现在指向「采集与打分」页的重跑开关。
+  if (h.scoring_failed)
+    notes.push(["warn", `打分失败 ${esc(h.scoring_failed)} 条 —— 去「采集与打分」勾上「重跑吸收态」再打一次分`]);
+  // Minor 3：话术生成失败——分数是真的、只是没能写出话术——单独一条计数，
+  // 不和上面"打分失败"混在一起（那会让人误以为分数本身不可信）。
+  if (h.pitch_failed)
+    notes.push(["warn", `话术生成失败 ${esc(h.pitch_failed)} 条（分数是有效的）—— 同样用「重跑吸收态」`]);
+  if (h.uncertain)
+    notes.push(["bad", `发送结果不确定 ${esc(h.uncertain)} 条 —— 消息可能已经发出，请到 Boss 对话列表人工核实`]);
+  // Minor 5：另一种 sending——认领之后、真正发送之前被打断，error 是空的。
+  // 和"发送结果不确定"分开措辞，因为它连发送按钮点没点到都不确定。
+  if (h.interrupted)
+    notes.push(["bad", `发送疑似中断 ${esc(h.interrupted)} 条 —— 连是否点过发送都不确定，请人工核实`]);
+
+  // 采集健康状态：被动信号，只反映上一次真的跑过 collect 时观察到的结果，
+  // 不是主动实时探活，所以措辞里如实带出「上次采集」。
+  // last_collect_at 是「最近一次尝试」，成功失败都前进；last_collect_ok_at
+  // 只在真正成功时前进。人工点掉错误横幅只清 last_collect_error——如果这里
+  // 只看它是否为空就说「未见异常」，会把刚被点掉的那次失败说成是干净的。
   if (h.last_collect_error) {
-    html += `<br><b class="gap">⚠️ 采集异常（截至上次采集，被动信号）：${esc(h.last_collect_error)}</b> ` +
-      `<button id="clear-err">知道了</button>`;
+    notes.push(["bad", `采集异常（截至上次采集，被动信号）：${esc(h.last_collect_error)}`, true]);
   } else if (h.last_collect_at && h.last_collect_at === h.last_collect_ok_at) {
-    html += `<br><span class="meta">上次采集 ${esc(h.last_collect_at)}，未见异常</span>`;
+    notes.push(["", `上次采集 ${esc(h.last_collect_at)}，未见异常`]);
   } else if (h.last_collect_at && h.last_collect_ok_at) {
-    html += `<br><span class="meta">上次尝试采集 ${esc(h.last_collect_at)}，最近一次成功 ${esc(h.last_collect_ok_at)}</span>`;
+    notes.push(["warn", `上次尝试采集 ${esc(h.last_collect_at)}，最近一次成功是 ${esc(h.last_collect_ok_at)}`]);
   } else if (h.last_collect_at) {
-    html += `<br><span class="meta">上次尝试采集 ${esc(h.last_collect_at)}，尚无成功记录</span>`;
+    notes.push(["warn", `上次尝试采集 ${esc(h.last_collect_at)}，尚无成功记录`]);
+  }
+
+  if (notes.length) {
+    // textHtml 同上：notes 里塞进来的每一条都已经在 push 的地方 esc() 过了
+    html += `<div class="notes">` + notes.map(([cls, textHtml, clearable]) =>
+      `<div class="note ${esc(cls)}">${textHtml}${clearable ? `<button class="btn quiet" id="clear-err">知道了</button>` : ""}</div>`
+    ).join("") + `</div>`;
   }
   $("#bar").innerHTML = html;
+
+  const tally = $("#t-queue");
+  tally.hidden = !h.pending;
+  tally.textContent = h.pending;
+
   const btn = $("#clear-err");
   if (btn) btn.onclick = async () => {
     try { await api("/api/health/clear-error", { method: "POST" }); await bar(); }
     catch (err) { showError(err); }
   };
 }
+
+/* ==================== 待确认队列 ==================== */
 
 // Minor 5：两种 sending 都渲染成一张只读卡片 + 一对 resolve 按钮——人工去
 // Boss 对话列表核实过之后点哪个都行，两个按钮背后都只是记账（sending →
@@ -136,142 +395,492 @@ async function bar() {
 // 没有（进程在认领之后、真正发送之前被打断，连点没点到都不确定）。
 function _sendingCard(row, noteHtml) {
   return `
-      <div class="card uncertain" data-resolve-id="${row.action_id}">
-        <b>${esc(row.title)}</b> · ${esc(row.company)}
-        <div class="meta"><a href="${safeHref(row.url)}" target="_blank">原页面</a></div>
+      <div class="card flag" data-resolve-id="${esc(row.action_id)}">
+        <div class="card-head"><div class="title">
+          <b>${esc(row.title)}</b> · ${esc(row.company)}
+          <div class="meta"><a href="${safeHref(row.url)}" target="_blank" rel="noopener">原页面</a></div>
+        </div></div>
         ${noteHtml}
         <div class="row">
-          <button data-resolve="sent">已确认送达</button>
-          <button data-resolve="failed">已确认未送达</button>
+          <button class="btn" data-resolve="sent">已确认送达</button>
+          <button class="btn" data-resolve="failed">已确认未送达</button>
         </div>
       </div>`;
 }
 
 async function renderQueue() {
   const { items, uncertain, interrupted } = await api("/api/queue");
-  let html = "";
+  let html = `<h2>待确认队列</h2>
+    <p class="lede">每一条都要你亲自过目。改完话术再点确认，发出去的就是框里这段文字。</p>`;
   if (uncertain.length) {
-    html += `<h3>发送结果不确定 —— 请人工到 Boss 对话列表核实</h3>` +
-      uncertain.map(u => _sendingCard(u, `<div class="gap">${esc(u.error)}</div>`)).join("");
+    html += `<h3>发送结果不确定 —— 请到 Boss 对话列表核实</h3>` +
+      uncertain.map(u => _sendingCard(u, `<div class="meta gap" style="margin-top:8px">${esc(u.error)}</div>`)).join("");
   }
   if (interrupted.length) {
-    html += `<h3>发送疑似中断 —— 执行器被打断，连是否点过发送都不确定，请人工到 Boss 对话列表核实</h3>` +
+    html += `<h3>发送疑似中断 —— 连是否点过发送都不确定</h3>` +
       interrupted.map(u => _sendingCard(u, "")).join("");
   }
   if (!items.length) {
-    html += "<p>队列为空。</p>";
+    html += `<div class="empty">队列为空。<br>去「采集与打分」跑一轮，或者先在「阈值」页定一个入队阈值。</div>`;
   } else {
+    html += (uncertain.length || interrupted.length) ? `<h3>等待确认</h3>` : "";
     html += items.map(i => `
-      <div class="card" data-id="${i.action_id}">
-        <span class="score">${i.total ?? "-"}</span>
-        <b>${esc(i.title)}</b> · ${esc(i.company)}
-        <div class="meta">${esc(i.city)} · ${esc(i.salary_raw)} ·
-          <a href="${safeHref(i.url)}" target="_blank">原页面</a> ·
-          <a href="#" data-detail="${esc(i.job_id)}">分数拆解</a></div>
-        <textarea>${esc(i.greeting)}</textarea>
-        <div class="row">
-          <button data-act="approve">确认发送</button>
-          <button data-act="skip">跳过</button>
+      <div class="card" data-id="${esc(i.action_id)}">
+        <div class="card-head">
+          <div class="title">
+            <b>${esc(i.title)}</b> · ${esc(i.company)}
+            <div class="meta">${esc(i.city)} · ${esc(i.salary_raw)} ·
+              <a href="${safeHref(i.url)}" target="_blank" rel="noopener">原页面</a> ·
+              <a href="#" data-detail="${esc(i.job_id)}">分数拆解</a></div>
+          </div>
+          <span class="score">${esc(i.total ?? "-")}</span>
         </div>
+        <div style="margin-top:12px"><textarea>${esc(i.greeting)}</textarea></div>
         <div class="detail"></div>
+        <div class="row">
+          <button class="btn primary" data-act="approve">确认发送</button>
+          <button class="btn" data-act="skip">跳过</button>
+        </div>
       </div>`).join("");
   }
   $("#main").innerHTML = html;
 }
 
+/* ==================== 采集与打分 ==================== */
+
+let keywords = [];
+let pollTimer = null;
+
+async function renderCollect() {
+  const s = await api("/api/settings");
+  const last = s.last_search || { keywords: [], city: "101210100", pages: 1 };
+  keywords = Array.isArray(last.keywords) ? last.keywords.slice() : [];
+
+  $("#main").innerHTML = `
+    <h2>采集与打分</h2>
+    <p class="lede">采集会驱动你本机那个 Chrome，所以浏览器要开着并且已经登录 Boss。
+      一次只能跑一个任务。</p>
+
+    <div class="card">
+      <h3>一、采集岗位</h3>
+      <label class="field"><span>搜索关键词（回车添加，可以加多个）</span>
+        <div class="tags" id="tags"></div>
+        <input id="kw" placeholder="例如：后端开发工程师" autocomplete="off">
+      </label>
+      <div class="grid c2">
+        <label class="field"><span>城市码（Boss 的 city code）</span>
+          <input id="city" value="${esc(last.city || "101210100")}" inputmode="numeric">
+        </label>
+        <label class="field"><span>每个关键词翻几页</span>
+          <input id="pages" type="number" min="1" max="10" value="${esc(last.pages || 1)}">
+        </label>
+      </div>
+      <div class="meta">杭州 101210100 · 上海 101020100 · 北京 101010100 · 深圳 101280600 · 广州 101280100</div>
+      <div class="row">
+        <button class="btn primary" id="go-collect">开始采集</button>
+        <span class="meta">列表页 → 预门禁刷掉明显不合的 → 只给幸存者抓详情页</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>二、归一化 + 门禁 + 打分</h3>
+      <p class="meta" style="margin-top:0">每个岗位两轮 LLM 调用。分数达到阈值才会生成待确认的招呼；
+        阈值没设时一条都不生成，这是冷启动期的保险。</p>
+      <div class="grid c2">
+        <label class="field"><span>最多处理几条（留空＝全部）</span>
+          <input id="limit" type="number" min="1" placeholder="全部">
+        </label>
+        <label class="field"><span>&nbsp;</span>
+          <label class="meta" style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
+            <input type="checkbox" id="rescore" style="width:auto;margin-top:3px">
+            <span>重跑吸收态：把打分失败、话术失败、被第二遍门禁刷掉、以及<b>已经打过分</b>的岗位
+              放回队列重新处理。改完权重或 prompt 要对照标注校准时用这个。</span>
+          </label>
+        </label>
+      </div>
+      <div class="row"><button class="btn primary" id="go-score">开始打分</button></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="title"><h3 style="margin:0">运行状态</h3></div>
+        <span id="run-pill"></span>
+      </div>
+      <div class="log" id="run-log"></div>
+      <div class="meta" id="run-summary" style="margin-top:10px"></div>
+    </div>`;
+
+  drawTags();
+  $("#kw").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const v = e.target.value.trim();
+    if (v && !keywords.includes(v)) { keywords.push(v); drawTags(); }
+    e.target.value = "";
+  });
+  $("#tags").addEventListener("click", (e) => {
+    const i = e.target.dataset.rm;
+    if (i !== undefined) { keywords.splice(Number(i), 1); drawTags(); }
+  });
+
+  $("#go-collect").onclick = async () => {
+    clearError();
+    const pending = $("#kw").value.trim();   // 还没按回车的那个也算数
+    const list = pending && !keywords.includes(pending) ? [...keywords, pending] : keywords;
+    try {
+      await send("/api/run/collect", "POST", {
+        keywords: list,
+        city: $("#city").value.trim(),
+        pages: Number($("#pages").value) || 1,
+      });
+      keywords = list; $("#kw").value = ""; drawTags();
+      pollRun();
+    } catch (err) { showError(err); }
+  };
+  $("#go-score").onclick = async () => {
+    clearError();
+    const raw = $("#limit").value.trim();
+    try {
+      await send("/api/run/score", "POST", {
+        limit: raw === "" ? null : Number(raw),
+        rescore: $("#rescore").checked,
+      });
+      pollRun();
+    } catch (err) { showError(err); }
+  };
+
+  await pollRun();
+}
+
+function drawTags() {
+  $("#tags").innerHTML = keywords.map((k, i) =>
+    `<span class="tag">${esc(k)}<button data-rm="${esc(i)}" title="移除">×</button></span>`
+  ).join("");
+}
+
+const SUMMARY_LABELS = {
+  listed: "列表条数", new: "新增", gated_out: "门禁刷掉", detail_fetched: "抓取详情",
+  scored: "已打分", failed: "打分失败", pitch_failed: "话术失败",
+  enqueued: "新入队", already_queued: "队列里已有", retracted: "撤回过期招呼",
+};
+
+/* 轮询后台任务状态。只在「运行中」时继续排下一次——任务结束后停表，
+   避免面板长期空转。切换视图时 render() 会把定时器清掉。 */
+async function pollRun() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  let task;
+  try {
+    ({ task } = await api("/api/run/status"));
+  } catch (err) { return showError(err); }
+
+  drawFloating(task);
+  const log = $("#run-log");
+  if (log && task) {
+    const pinned = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    log.innerHTML = task.lines.map(l => `${esc(l)}\n`).join("");
+    if (pinned) log.scrollTop = log.scrollHeight;
+
+    const label = { running: "运行中", done: "已完成", failed: "失败" }[task.status] || task.status;
+    $("#run-pill").innerHTML =
+      `<span class="pill ${esc(task.status)}">${task.status === "running" ? `<i class="dot"></i>` : ""}${esc(label)} · ${esc(task.label)}</span>`;
+
+    // 只显示非零的计数。一整行「已打分 0 · 门禁刷掉 0 · 打分失败 0 …」
+    // 读起来全是噪音，真正有信息的那几个数字反而被埋掉了。
+    const parts = [];
+    if (task.summary) {
+      for (const [k, v] of Object.entries(task.summary)) {
+        if (k === "errors" || !v || !SUMMARY_LABELS[k]) continue;
+        parts.push(`${esc(SUMMARY_LABELS[k])} ${esc(v)}`);
+      }
+      if (!parts.length && task.status === "done") parts.push("这一轮没有需要处理的岗位");
+    }
+    const errs = (task.summary && task.summary.errors) || [];
+    if (errs.length) parts.push(`<span class="gap">${esc(errs.length)} 条出错，详见上面的日志</span>`);
+    if (task.error) parts.push(`<span class="gap">${esc(task.error)}</span>`);
+    $("#run-summary").innerHTML = parts.join("　·　");
+  }
+
+  if (task && task.status === "running") {
+    pollTimer = setTimeout(pollRun, 1500);
+  } else if (task && log) {
+    await bar();   // 跑完了，顶部计数要跟上
+  }
+}
+
+function drawFloating(task) {
+  const box = $("#float");
+  if (!task || task.status !== "running" || view === "collect") { box.innerHTML = ""; return; }
+  box.innerHTML = `<div class="floating" id="go-run">
+      <span class="pill running"><i class="dot"></i>${esc(task.label)} 运行中</span>
+      <span class="meta">查看</span></div>`;
+  $("#go-run").onclick = () => switchTo("collect");
+}
+
+/* ==================== 能力卡片 ==================== */
+
+const STRENGTHS = ["强", "中", "弱"];
+const STRENGTH_HINT = { "强": "能讲 30 分钟", "中": "能讲 5 分钟", "弱": "仅接触" };
+let cardsData = [];
+let cardsLocked = false;   // 文件读不出来时禁止保存，别用空列表覆盖掉真卡片
+
+async function renderCards() {
+  const r = await api("/api/cards");
+  cardsData = r.cards;
+  cardsLocked = !!r.error;
+  drawCards(r);
+}
+
+function drawCards(meta) {
+  const total = cardsData.length || 1;
+  const n = (s) => cardsData.filter(c => c.strength === s).length;
+  const [strong, medium, weak] = STRENGTHS.map(n);
+  const pct = (x) => `${(x / total * 100).toFixed(1)}%`;
+
+  let html = `<h2>能力卡片</h2>
+    <p class="lede">打分器只认这里写的东西。「证据强度」是整套系统防止简历吹牛的唯一防线，
+      宁可低估 —— 标高了，出来的分数和话术都会虚。</p>`;
+
+  if (meta && meta.error) {
+    html += `<div class="card flag"><b>卡片库读不出来，保存已锁定</b>
+      <div class="meta gap" style="margin-top:6px">${esc(meta.error)}</div>
+      <div class="meta" style="margin-top:6px">请先手工修好
+        <code>${esc(meta.path)}</code> 再刷新本页。锁定是为了防止用一个空列表把文件覆盖掉。</div></div>`;
+  }
+
+  html += `<div class="card">
+      <div class="row" style="margin-top:0">
+        <div>
+          <b>${esc(cardsData.length)} 张卡片</b>
+          <div class="dist">
+            <i class="s" style="width:${esc(pct(strong))}"></i>
+            <i class="m" style="width:${esc(pct(medium))}"></i>
+            <i class="w" style="width:${esc(pct(weak))}"></i>
+          </div>
+          <span class="meta">强 ${esc(strong)} · 中 ${esc(medium)} · 弱 ${esc(weak)}</span>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn" id="add-card" ${cardsLocked ? "disabled" : ""}>新增卡片</button>
+        <button class="btn primary" id="save-cards" ${cardsLocked ? "disabled" : ""}>保存全部</button>
+      </div>
+      ${strong / total > 0.6 ? `<div class="note warn" style="margin-top:12px">
+        标成「强」的占 ${esc(pct(strong))}。「强」的定义是能就这个能力讲满 30 分钟并接受追问 ——
+        比例偏高通常意味着这一列还没有逐张校对过。</div>` : ""}
+      <div class="meta" style="margin-top:10px">
+        文件：<code>${esc((meta && meta.path) || "")}</code>
+        每次保存前会自动在同目录的 <code>card-backups/</code> 里留一份带时间戳的备份。
+      </div>
+    </div>`;
+
+  html += cardsData.map((c, i) => `
+    <details class="cap" data-card="${esc(i)}">
+      <summary>
+        <span class="badge ${esc(c.strength)}">${esc(c.strength)}</span>
+        <b>${esc(c.capability) || "（未命名）"}</b>
+        <span class="meta">${esc(c.project)}</span>
+        <span class="spacer"></span>
+        <span class="meta mono">${esc(c.id)}</span>
+      </summary>
+      <div class="body">
+        <div class="grid c3">
+          <label class="field"><span>能力</span><input data-f="capability" value="${esc(c.capability)}"></label>
+          <label class="field"><span>id（唯一）</span><input data-f="id" value="${esc(c.id)}"></label>
+          <label class="field"><span>证据强度</span>
+            <select data-f="strength">${STRENGTHS.map(s =>
+              `<option value="${esc(s)}" ${s === c.strength ? "selected" : ""}>${esc(s)} —— ${esc(STRENGTH_HINT[s])}</option>`
+            ).join("")}</select></label>
+        </div>
+        <label class="field"><span>同义表述（逗号分隔；JD 措辞和简历措辞很少一致，宁可写多）</span>
+          <input data-f="synonyms" value="${esc(c.synonyms.join(", "))}"></label>
+        <div class="grid c2">
+          <label class="field"><span>项目</span><input data-f="project" value="${esc(c.project)}"></label>
+          <label class="field"><span>可量化（只写口径名称，不写数字本身）</span>
+            <input data-f="metrics" value="${esc(c.metrics.join(", "))}"></label>
+        </div>
+        <label class="field"><span>可讲深度</span>
+          <textarea data-f="depth" style="min-height:70px">${esc(c.depth)}</textarea></label>
+        <label class="field"><span>关联简历版本（逗号分隔）</span>
+          <input data-f="resume_versions" value="${esc(c.resume_versions.join(", "))}"></label>
+        <div class="row right"><button class="btn danger" data-del="${esc(i)}">删除这张</button></div>
+      </div>
+    </details>`).join("");
+
+  $("#main").innerHTML = html;
+
+  const add = $("#add-card");
+  if (add) add.onclick = () => {
+    harvestCards();
+    cardsData.push({
+      id: `cap-${Date.now().toString(36)}`, capability: "", synonyms: [],
+      strength: "中", project: "", metrics: [], depth: "", resume_versions: [],
+    });
+    drawCards(meta);
+    const last = document.querySelector(".cap:last-of-type");
+    if (last) { last.open = true; last.scrollIntoView({ behavior: "smooth", block: "center" }); }
+  };
+  const save = $("#save-cards");
+  if (save) save.onclick = async () => {
+    clearError();
+    harvestCards();
+    try {
+      const r = await send("/api/cards", "PUT", { cards: cardsData });
+      showOk(`已保存 ${r.count} 张卡片（其中「强」${r.strong} 张），旧文件已备份`);
+      await renderCards();
+    } catch (err) { showError(err); }
+  };
+  $("#main").addEventListener("click", (e) => {
+    const i = e.target.dataset.del;
+    if (i === undefined) return;
+    harvestCards();
+    cardsData.splice(Number(i), 1);
+    drawCards(meta);
+  });
+}
+
+/* 把 DOM 里的编辑结果读回 cardsData。不在每次输入时同步状态，是为了避免
+   重渲染打断正在输入的输入框（焦点和光标位置都会丢）。 */
+function harvestCards() {
+  for (const box of document.querySelectorAll("[data-card]")) {
+    const c = cardsData[Number(box.dataset.card)];
+    if (!c) continue;
+    for (const el of box.querySelectorAll("[data-f]")) {
+      const f = el.dataset.f;
+      c[f] = ["synonyms", "metrics", "resume_versions"].includes(f)
+        ? el.value.split(/[,，]/).map(s => s.trim()).filter(Boolean)
+        : el.value;
+    }
+  }
+}
+
+/* ==================== 标注 / 阈值 / 设置 ==================== */
+
 async function renderLabel() {
   const j = await api("/api/label/next");
-  if (!j.job_id) { $("#main").innerHTML = "<p>没有待标注的岗位了。</p>"; return; }
-  $("#main").innerHTML = `
+  let html = `<h2>标注</h2>
+    <p class="lede">只问一句：这个岗位你会不会投？攒够 30-50 条之后，「阈值」页就能反推出入队阈值。</p>`;
+  if (!j.job_id) {
+    $("#main").innerHTML = html + `<div class="empty">没有待标注的岗位了。<br>先去「采集与打分」跑一轮。</div>`;
+    return;
+  }
+  $("#main").innerHTML = html + `
     <div class="card" data-label="${esc(j.job_id)}">
-      <span class="score">${j.total}</span>
-      <b>${esc(j.title)}</b> · ${esc(j.company)}
-      <div class="meta">${esc(j.city)} · ${esc(j.salary_raw)}</div>
+      <div class="card-head">
+        <div class="title">
+          <b>${esc(j.title)}</b> · ${esc(j.company)}
+          <div class="meta">${esc(j.city)} · ${esc(j.salary_raw)}</div>
+        </div>
+        <span class="score">${esc(j.total)}</span>
+      </div>
       <div class="jd">${esc(j.raw_jd)}</div>
       <div class="row">
-        <button data-label-yes>会投 (y)</button>
-        <button data-label-no>不会投 (n)</button>
+        <button class="btn primary" data-label-yes>会投</button>
+        <button class="btn" data-label-no>不会投</button>
+        <span class="meta">键盘 y / n 可以快速翻页</span>
       </div>
-      <div class="meta">键盘 y / n 可以快速翻页</div>
     </div>`;
 }
 
 async function renderThreshold() {
   const t = await api("/api/threshold");
-  const f = (g) => g.count ? `${g.count} 条，区间 ${g.min} – ${g.max}，均值 ${g.mean}` : "无";
+  // 名字以 Html 结尾 = 返回的是已经转义好的片段（本文件的约定，扫描器认它）
+  const groupHtml = (g) => g.count ? `${esc(g.count)} 条，区间 ${esc(g.min)} – ${esc(g.max)}，均值 ${esc(g.mean)}` : "无";
   $("#main").innerHTML = `
+    <h2>阈值</h2>
+    <p class="lede">用你的标注反推阈值，而不是拍脑袋定一个数。</p>
     <div class="card">
-      <p>已标注 <b>${t.labeled_total}</b> 条（设计文档建议 30-50 条后再定阈值）。</p>
-      <p>会投：${f(t.would_apply)}</p>
-      <p>不会投：${f(t.would_not_apply)}</p>
-      <p class="meta">会投组的下界和不会投组的上界之间，就是阈值的候选区间。
-        若两组大量重叠，说明某个维度权重不对，先去设置里调权重再重跑打分。</p>
-      <p class="meta">会投分数：${t.scores_yes.join(", ") || "无"}</p>
-      <p class="meta">不会投分数：${t.scores_no.join(", ") || "无"}</p>
+      <div class="stats">
+        <div class="stat"><span class="k">已标注</span><span class="v">${esc(t.labeled_total)}<small> 条</small></span></div>
+        <div class="stat"><span class="k">会投</span><span class="v">${esc(t.would_apply.count)}</span></div>
+        <div class="stat"><span class="k">不会投</span><span class="v">${esc(t.would_not_apply.count)}</span></div>
+      </div>
+      <p style="margin-bottom:4px">会投：${groupHtml(t.would_apply)}</p>
+      <p style="margin-top:0">不会投：${groupHtml(t.would_not_apply)}</p>
+      <div class="note">会投组的下界和不会投组的上界之间，就是阈值的候选区间。
+        两组若大量重叠，说明某个维度权重不对 —— 先去「设置」调权重，再回「采集与打分」勾上「重跑吸收态」重打一遍。</div>
+      <p class="meta" style="margin-bottom:0">会投分数：${esc(t.scores_yes.join(", ")) || "无"}</p>
+      <p class="meta" style="margin-top:2px">不会投分数：${esc(t.scores_no.join(", ")) || "无"}</p>
     </div>`;
 }
 
+// 这几项由程序写入（采集健康状态、上次搜索条件），不该混在人工编辑区里
+// 让人误以为是可调的旋钮。
+const MACHINE_KEYS = ["last_collect_error", "last_collect_at", "last_collect_ok_at", "last_search"];
+
 async function renderSettings() {
   const s = await api("/api/settings");
-  $("#main").innerHTML = `<div class="card">` + Object.entries(s).map(([k, v]) =>
-    `<label>${esc(k)}<br><input data-key="${esc(k)}" value='${esc(JSON.stringify(v))}'></label>`
-  ).join("") + `<button id="save">保存</button>
-    <div class="meta">值按 JSON 解析。score_threshold 填 null 表示冷启动期不生成动作。</div></div>`;
+  const editable = Object.entries(s).filter(([k]) => !MACHINE_KEYS.includes(k));
+  $("#main").innerHTML = `
+    <h2>设置</h2>
+    <p class="lede">值按 JSON 解析。<code>score_threshold</code> 填 <code>null</code> 表示冷启动期，一条动作都不生成。</p>
+    <div class="card">` +
+    editable.map(([k, v]) =>
+      `<label class="field"><span>${esc(k)}</span><input data-key="${esc(k)}" value='${esc(JSON.stringify(v))}'></label>`
+    ).join("") +
+    `<div class="row"><button class="btn primary" id="save">保存</button></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">只读状态（由程序写入）</h3>` +
+      MACHINE_KEYS.map(k =>
+        `<div class="meta"><code>${esc(k)}</code> = ${esc(JSON.stringify(s[k]))}</div>`
+      ).join("") + `</div>`;
+
   $("#save").onclick = async () => {
     clearError();
     const body = {};
     for (const el of document.querySelectorAll("[data-key]")) {
       try { body[el.dataset.key] = JSON.parse(el.value); }
-      catch { alert(`${el.dataset.key} 不是合法 JSON`); return; }
+      catch { return showError(`${el.dataset.key} 不是合法 JSON`); }
     }
     // Important 6：Task 12 加了 validate_setting_value 专门让坏设置在写入
-    // 时就 400——但改之前这里没有 try/catch，PUT 被 api() reject 之后
-    // 这个 async 函数直接整体失败，既不报错也不提示"已保存"，用户合理地
-    // 以为保存成功了。加 try/catch，把服务端的错误消息原样（转义后）
-    // 显示出来，而不是用一句含糊的"出错了"盖过去。
+    // 时就 400——但改之前这里没有 try/catch，PUT 被 api() reject 之后这个
+    // async 函数直接整体失败，既不报错也不提示"已保存"，用户合理地以为
+    // 保存成功了。把服务端的错误消息原样（转义后）显示出来。
     try {
-      await api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      await send("/api/settings", "PUT", body);
       await bar();
-      alert("已保存");
-    } catch (err) {
-      showError(err);
-    }
+      showOk("设置已保存");
+    } catch (err) { showError(err); }
   };
 }
 
-const VIEWS = { queue: renderQueue, label: renderLabel, threshold: renderThreshold, settings: renderSettings };
+/* ==================== 路由 ==================== */
+
+const VIEWS = {
+  queue: renderQueue, collect: renderCollect, cards: renderCards,
+  label: renderLabel, threshold: renderThreshold, settings: renderSettings,
+};
+
 async function render() {
-  // Important 6：bar()/renderQueue()/renderLabel()/renderThreshold() 都在
-  // 这里统一 await——任何一个的 api() 调用失败，都会顺着这条 await 链条
-  // 冒泡到这里被兜住，而不是变成一个没人看的 unhandled rejection、把页面
-  // 晾在半渲染的状态。renderSettings() 本身的失败也会被这里兜住；它自己
-  // 的 #save 按钮另有一层 try/catch，因为那次失败发生在 render() 已经
-  // 返回之后。
+  // Important 6：所有视图和 bar() 都在这里统一 await——任何一个的 api()
+  // 调用失败，都会顺着这条 await 链条冒泡到这里被兜住，而不是变成一条
+  // 没人看的 unhandled rejection、把页面晾在半渲染的状态。
   clearError();
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   try {
     await bar();
     await VIEWS[view]();
+    if (view !== "collect") await pollRun();   // 别的视图上也要能看到「正在跑」
   } catch (err) {
     showError(err);
   }
 }
 
+function switchTo(next) {
+  view = next;
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.view === next));
+  return render();
+}
+
 document.addEventListener("click", async (e) => {
   const navBtn = e.target.closest("nav button");
-  if (navBtn) {
-    document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b === navBtn));
-    view = navBtn.dataset.view; return render();
-  }
+  if (navBtn) return switchTo(navBtn.dataset.view);
+
   const act = e.target.dataset.act;
   if (act) {
     const card = e.target.closest(".card");
     const id = card.dataset.id;
     const greeting = card.querySelector("textarea").value;
     try {
-      await api(`/api/actions/${id}/${act}`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(act === "approve" ? { greeting } : {}),
-      });
+      await send(`/api/actions/${id}/${act}`, "POST", act === "approve" ? { greeting } : {});
     } catch (err) {
       // showError 必须排在 render() 之后：render() 开头就 clearError()，
       // 先报错再重渲染的话，刚写上去的错误横幅会在同一帧里被抹掉——人工
@@ -284,6 +893,7 @@ document.addEventListener("click", async (e) => {
     }
     return render();
   }
+
   // Minor 5：resolve 按钮——人工去 Boss 对话列表核实过一条 sending 行之后，
   // 点这里记录看到的结果。两个按钮都只是记账（sending → sent / sending →
   // failed），不会打开浏览器、不会真的发消息。
@@ -292,34 +902,34 @@ document.addEventListener("click", async (e) => {
     const card = e.target.closest("[data-resolve-id]");
     const id = card.dataset.resolveId;
     try {
-      await api(`/api/actions/${id}/resolve`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ outcome: resolve }),
-      });
+      await send(`/api/actions/${id}/resolve`, "POST", { outcome: resolve });
     } catch (err) {
       await render();  // 同上：render() 会 clearError()，报错必须排在它之后
       return showError(err);
     }
     return render();
   }
+
   const detail = e.target.dataset.detail;
   if (detail) {
     e.preventDefault();
     const box = e.target.closest(".card").querySelector(".detail");
+    if (box.innerHTML) { box.innerHTML = ""; return; }
     try {
       const d = await api(`/api/jobs/${detail}`);
-      box.innerHTML = d.dimensions.map(dim => `
-      <div style="margin-top:10px">
-        <b>${esc(dim.label)}: ${dim.score}</b><br>
-        <span class="meta">${esc(dim.reason)}</span><br>
-        ${dim.cards.map(c => `<span class="meta">[${esc(c.id)}] ${esc(c.capability)}（证据${esc(c.strength)}）· ${esc(c.project)}</span><br>`).join("")}
-        <span class="gap">缺口：${esc(dim.gap)}</span>
-      </div>`).join("");
+      box.innerHTML = `<div class="jd" style="white-space:normal">` + d.dimensions.map(dim => `
+        <div style="margin-bottom:10px">
+          <b>${esc(dim.label)}：${esc(dim.score)}</b><br>
+          <span class="meta">${esc(dim.reason)}</span><br>
+          ${dim.cards.map(c => `<span class="meta">[${esc(c.id)}] ${esc(c.capability)}（证据${esc(c.strength)}）· ${esc(c.project)}</span><br>`).join("")}
+          <span class="meta gap">缺口：${esc(dim.gap)}</span>
+        </div>`).join("") + `</div>`;
     } catch (err) {
       showError(err);
     }
     return;
   }
+
   const yes = e.target.hasAttribute("data-label-yes");
   const no = e.target.hasAttribute("data-label-no");
   if (yes || no) return label(yes);
@@ -329,10 +939,7 @@ async function label(wouldApply) {
   const card = document.querySelector("[data-label]");
   if (!card) return;
   try {
-    await api("/api/label", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: card.dataset.label, would_apply: wouldApply }),
-    });
+    await send("/api/label", "POST", { job_id: card.dataset.label, would_apply: wouldApply });
   } catch (err) {
     showError(err);
     return;

@@ -43,6 +43,9 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "last_collect_error": None,
     "last_collect_at": None,
     "last_collect_ok_at": None,
+    # 面板「采集」页上次用的搜索条件，纯粹为了下次打开时预填表单。
+    # 城市码是 Boss 的 city code（杭州 101210100）。
+    "last_search": {"keywords": [], "city": "101210100", "pages": 1},
 }
 
 
@@ -171,6 +174,18 @@ def validate_setting_value(key: str, value: Any) -> None:
     elif key in ("last_collect_error", "last_collect_at", "last_collect_ok_at"):
         if value is not None and not isinstance(value, str):
             raise ValueError(f"{key} 必须是字符串或 null")
+
+    elif key == "last_search":
+        if not isinstance(value, dict):
+            raise ValueError(f"{key} 必须是字典")
+        if not _is_str_list(value.get("keywords", [])):
+            raise ValueError(f"{key}.keywords 必须是字符串列表")
+        city = value.get("city", "")
+        if not isinstance(city, str) or not city.isdigit():
+            raise ValueError(f"{key}.city 必须是纯数字的城市码字符串")
+        pages = value.get("pages", 1)
+        if not isinstance(pages, int) or isinstance(pages, bool) or not 1 <= pages <= 10:
+            raise ValueError(f"{key}.pages 必须是 1-10 的整数")
 
 
 def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
