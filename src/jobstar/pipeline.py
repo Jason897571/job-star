@@ -37,6 +37,10 @@ class CollectReport:
     new: int = 0
     gated_out: int = 0
     detail_fetched: int = 0
+    # 人工中途点了停止。这两个字段必须存在：只报「抓了 3 条」而不说还剩
+    # 27 条没碰，看起来就像正常跑完了。
+    stopped: bool = False
+    remaining: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -51,6 +55,10 @@ class ScoreReport:
     # 也就不可能已经有动作）：
     already_queued: int = 0  # 队列里已经有这个岗位的动作，本轮没有重新生成话术
     retracted: int = 0  # 重跑后不再合格，队列里那条旧动作被撤回成「跳过」
+    # 人工中途点了停止，以及还剩几个岗位没轮到。已经处理过的岗位都已落库，
+    # 不会丢；没轮到的下次跑 score 还会被捡起来（它们没有 scores 行）。
+    stopped: bool = False
+    remaining: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -124,18 +132,24 @@ def run_collect(
     fetch_fn: Callable[..., list[dict]] | None = None,
     detail_fn: Callable[[str], dict] | None = None,
     on_progress: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> CollectReport:
     """`on_progress` 每处理完一个岗位调用一次，给面板做进度条用。
 
     一轮采集要开真实浏览器逐条抓详情页，几分钟起步；没有逐条进度的话，
     面板上就是一个几分钟不动、分不清「在跑」和「卡死」的转圈。CLI 不传
     这个参数，行为完全不变。
+
+    `should_stop()` 为真时在**下一个岗位开始之前**收工。检查点刻意放在
+    循环顶部而不是中间：一个岗位要么完整走完（门禁结果 + 详情页都落库），
+    要么根本没开始，不会留下门禁写了、详情页没抓的半截状态。
     """
     from jobstar.collector import boss
 
     fetch_fn = fetch_fn or boss.fetch_list
     detail_fn = detail_fn or boss.fetch_detail
     note = on_progress or (lambda _: None)
+    stop = should_stop or (lambda: False)
 
     report = CollectReport()
     try:
@@ -154,7 +168,13 @@ def run_collect(
 
     rules = _gate_rules(conn)
 
-    for item in items:
+    for index, item in enumerate(items):
+        if stop():
+            report.stopped = True
+            report.remaining = len(items) - index
+            note(f"已停止，还有 {report.remaining} 条没处理（已抓到的都已入库）")
+            break
+
         row = conn.execute(
             "SELECT * FROM jobs WHERE job_id = ?", (item["job_id"],)
         ).fetchone()
@@ -365,6 +385,7 @@ def run_score(
     limit: int | None = None,
     job_id: str | None = None,
     on_progress: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> ScoreReport:
     """对已抓详情、已过第一遍门禁、还没打过分的岗位做归一化 + 门禁 + 打分。
 
@@ -374,9 +395,16 @@ def run_score(
 
     `on_progress` 每处理完一个岗位调用一次（每个岗位两轮 LLM 调用，几十条
     就是几分钟），给面板做进度条用。CLI 不传，行为完全不变。
+
+    `should_stop()` 为真时在**下一个岗位开始之前**收工。检查点只放在循环
+    顶部：中途插一个检查点会留下半截状态——最糟的是「分数写了、话术没写」，
+    因为 scores 行一旦存在，这个岗位就落进 run_score 的吸收态，不加
+    --rescore 再也回不来了。停在边界上则干净：没轮到的岗位没有 scores 行，
+    下次跑 score 会照常被捡起来。
     """
     report = ScoreReport()
     note = on_progress or (lambda _: None)
+    stop = should_stop or (lambda: False)
     sql = (
         "SELECT j.* FROM jobs j "
         "JOIN gate_results g ON g.job_id = j.job_id AND g.passed = 1 "
@@ -394,7 +422,13 @@ def run_score(
     weights = get_setting(conn, "dimension_weights")
     rules = _gate_rules(conn)
 
-    for row in rows:
+    for index, row in enumerate(rows):
+        if stop():
+            report.stopped = True
+            report.remaining = len(rows) - index
+            note(f"已停止，还有 {report.remaining} 个岗位没处理（已打的分都已入库）")
+            break
+
         try:
             req = normalize(
                 job_id=row["job_id"],

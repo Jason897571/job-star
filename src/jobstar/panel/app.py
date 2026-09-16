@@ -603,6 +603,19 @@ def _busy(exc: AlreadyRunning) -> HTTPException:
     return HTTPException(409, str(exc))
 
 
+@app.post("/api/run/stop", dependencies=[Depends(require_panel_request)])
+def run_stop(runner: TaskRunner = Depends(get_runner)) -> dict:
+    """请求停止正在跑的任务。
+
+    只置标志就返回，不等后台线程收工——任务当前多半正阻塞在一次 LLM 调用
+    或一次详情页抓取上（各自 180 秒超时），在这个请求里等会把 HTTP 也挂住。
+    面板靠轮询看到 `stop_requested` 为真、状态仍是 running，显示「正在停止…」。
+    """
+    if not runner.request_stop():
+        raise HTTPException(409, "现在没有正在跑的任务")
+    return {"ok": True}
+
+
 @app.post("/api/run/collect", dependencies=[Depends(require_panel_request)])
 def run_collect_task(
     body: dict = Body(...),
@@ -632,14 +645,23 @@ def run_collect_task(
 
     label = f"{keywords[0]} 等 {len(keywords)} 个关键词" if len(keywords) > 1 else keywords[0]
 
-    def work(note):
+    def work(note, should_stop):
         from jobstar.collector.boss import LoginRequired
         from jobstar.pipeline import run_collect
 
         task_conn = get_conn(get_settings().db_path)
-        totals = {"listed": 0, "new": 0, "gated_out": 0, "detail_fetched": 0, "errors": []}
+        totals = {
+            "listed": 0, "new": 0, "gated_out": 0, "detail_fetched": 0,
+            "stopped": False, "remaining": 0, "errors": [],
+        }
         try:
             for keyword in keywords:
+                # 关键词之间也是一个停止边界——不然点了停止还要把剩下的
+                # 关键词整个跑完。
+                if should_stop():
+                    totals["stopped"] = True
+                    note("已停止，剩下的关键词不再采集")
+                    break
                 note(f"▶ 开始采集「{keyword}」（{pages} 页）")
                 try:
                     report = run_collect(
@@ -648,6 +670,7 @@ def run_collect_task(
                         city_code=city,
                         pages=pages,
                         on_progress=note,
+                        should_stop=should_stop,
                     )
                 except LoginRequired as exc:
                     # 登录态失效是会话级硬故障：剩下的关键词再跑也只是拿一个
@@ -663,6 +686,10 @@ def run_collect_task(
                 for key in ("listed", "new", "gated_out", "detail_fetched"):
                     totals[key] += getattr(report, key)
                 totals["errors"].extend(report.errors)
+                if report.stopped:
+                    totals["stopped"] = True
+                    totals["remaining"] += report.remaining
+                    break
             _record_collect_health(task_conn, totals)
             return totals
         finally:
@@ -689,7 +716,7 @@ def run_score_task(
         if limit < 1:
             raise HTTPException(400, "条数上限至少是 1")
 
-    def work(note):
+    def work(note, should_stop):
         from jobstar.pipeline import clear_for_rescore, run_score
 
         task_conn = get_conn(get_settings().db_path)
@@ -702,8 +729,12 @@ def run_score_task(
                 )
                 if cleared == 0:
                     note("没有岗位处于吸收态——这一轮和不勾「重跑」完全一样")
-            report = run_score(task_conn, limit=limit, on_progress=note)
+            report = run_score(
+                task_conn, limit=limit, on_progress=note, should_stop=should_stop
+            )
             return {
+                "stopped": report.stopped,
+                "remaining": report.remaining,
                 "scored": report.scored,
                 "gated_out": report.gated_out,
                 "failed": report.failed,

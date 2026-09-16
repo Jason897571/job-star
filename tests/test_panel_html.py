@@ -376,3 +376,22 @@ def test_panel_javascript_parses():
         text=True,
     )
     assert proc.returncode == 0, f"面板 JS 语法错误：\n{proc.stderr}"
+
+
+def test_the_running_task_has_a_visible_stop_control():
+    """打分一轮几十个岗位、每个两三次 LLM 调用。没有停止按钮时，人工唯一
+    的出路是去杀进程——那会留下一堆半截状态。"""
+    collect_view = HTML[HTML.index("async function renderCollect()") :]
+    collect_view = collect_view[: collect_view.index("\nfunction drawTags()")]
+    assert 'id="go-stop"' in collect_view, "采集页上没有停止按钮"
+    assert "/api/run/stop" in collect_view, "停止按钮没有接到停止端点"
+
+
+def test_the_panel_says_stopping_is_not_instant():
+    """停止是协作式的，要等当前这个岗位跑完（LLM 调用没法中途掐断）。
+    界面必须如实说，否则人会以为按钮没生效、连点或者直接杀进程。"""
+    poll = HTML[HTML.index("async function pollRun()") :]
+    poll = poll[: poll.index("\nfunction drawFloating")]
+    assert "正在停止" in poll, "没有区分「运行中」和「正在停止」"
+    assert "stop_requested" in poll, "正在停止的判断没有用后端的 stop_requested"
+    assert "跑完" in poll, "没有说清停止会在当前这个岗位跑完之后生效"

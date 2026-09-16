@@ -670,3 +670,111 @@ def test_rescore_does_not_regenerate_a_pitch_for_an_action_that_already_exists(
     assert pitches == [], "队列里已有动作，不该再调一次 LLM 写话术"
     row = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
     assert json.loads(row["payload"])["greeting"] == "第一版开场白"
+
+
+# --- 协作式停止 -------------------------------------------------------------
+#
+# 检查点只放在循环顶部。中途插一个会留下半截状态，最糟的是「分数写了、
+# 话术没写」——scores 行一旦存在，这个岗位就落进 run_score 的吸收态，不加
+# --rescore 再也回不来了。停在边界上则干净：没轮到的岗位没有 scores 行，
+# 下次跑 score 会照常被捡起来。
+
+
+def test_run_score_stops_at_a_job_boundary_and_keeps_what_it_finished(conn, monkeypatch):
+    set_setting(conn, "score_threshold", 70)
+    for job_id in ("j1", "j2", "j3", "j4"):
+        _seed_scorable(conn, job_id)
+
+    done: list[str] = []
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    monkeypatch.setattr("jobstar.pipeline.write_pitch", lambda **kw: "开场白")
+    monkeypatch.setattr(
+        "jobstar.pipeline.normalize",
+        lambda **kw: (done.append(kw["job_id"]), _req(kw["job_id"]))[1],
+    )
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 80.0, (), "v1"),
+    )
+
+    # 处理完两个之后请求停止
+    report = run_score(conn, should_stop=lambda: len(done) >= 2)
+
+    assert done == ["j1", "j2"], "第三个岗位根本不该开始"
+    assert report.scored == 2
+    assert (report.stopped, report.remaining) == (True, 2)
+
+    scored = {r["job_id"] for r in conn.execute("SELECT job_id FROM scores")}
+    assert scored == {"j1", "j2"}, "已经打完的分必须留下"
+    assert {r["job_id"] for r in conn.execute("SELECT job_id FROM actions")} == {"j1", "j2"}
+
+
+def test_jobs_skipped_by_a_stop_are_picked_up_by_the_next_run(conn, monkeypatch):
+    """被停掉的那些岗位不需要 --rescore——它们没有 scores 行，本来就还在
+    run_score 的取数范围里。这条是「停止不会烧掉岗位」的保证。"""
+    for job_id in ("j1", "j2", "j3"):
+        _seed_scorable(conn, job_id)
+
+    done: list[str] = []
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    monkeypatch.setattr(
+        "jobstar.pipeline.normalize",
+        lambda **kw: (done.append(kw["job_id"]), _req(kw["job_id"]))[1],
+    )
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 80.0, (), "v1"),
+    )
+
+    assert run_score(conn, should_stop=lambda: len(done) >= 1).remaining == 2
+    assert run_score(conn).scored == 2, "剩下的两个不用 --rescore 就该被捡起来"
+    assert done == ["j1", "j2", "j3"]
+
+
+def test_not_passing_should_stop_keeps_the_old_behaviour(conn, monkeypatch):
+    """CLI 不传 should_stop，行为必须和以前完全一样。"""
+    for job_id in ("j1", "j2"):
+        _seed_scorable(conn, job_id)
+    monkeypatch.setattr("jobstar.pipeline.load_cards", lambda path: ())
+    monkeypatch.setattr("jobstar.pipeline.normalize", lambda **kw: _req(kw["job_id"]))
+    monkeypatch.setattr(
+        "jobstar.pipeline.score",
+        lambda req, cards, weights: ScoreResult(req.job_id, 80.0, (), "v1"),
+    )
+    report = run_score(conn)
+    assert (report.scored, report.stopped, report.remaining) == (2, False, 0)
+
+
+def test_run_collect_stops_before_opening_the_next_detail_page(conn):
+    """采集的停止点同样在边界上：一个岗位要么门禁结果和详情页都落库，
+    要么根本没开始，不会留下门禁写了、详情页没抓的半截状态。"""
+    listed = [
+        {
+            "job_id": f"j{i}",
+            "url": f"https://x/job_detail/j{i}~.html",
+            "title": "后端",
+            "company": "A",
+            "city": "杭州",
+            "salary_raw": "30-50K",
+            "hr_name": "张",
+            "tags": ["3-5年", "本科"],
+        }
+        for i in range(1, 5)
+    ]
+    fetched: list[str] = []
+
+    report = run_collect(
+        conn,
+        keyword="后端",
+        city_code="101210100",
+        fetch_fn=lambda **kw: listed,
+        detail_fn=lambda url: (fetched.append(url), {"raw_jd": "JD 全文"})[1],
+        should_stop=lambda: len(fetched) >= 2,
+    )
+
+    assert len(fetched) == 2, "第三个岗位不该再被打开"
+    assert (report.stopped, report.detail_fetched) == (True, 2)
+    assert report.remaining == 2
+    # 没轮到的岗位：列表页已经入库（save_jobs 在循环之前），但没有门禁结果
+    assert conn.execute("SELECT COUNT(*) n FROM jobs").fetchone()["n"] == 4
+    assert conn.execute("SELECT COUNT(*) n FROM gate_results").fetchone()["n"] == 2

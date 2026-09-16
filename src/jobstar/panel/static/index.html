@@ -211,6 +211,7 @@
   }
   .pill.running { background: var(--accent-soft); color: var(--accent); }
   .pill.done { background: var(--surface-2); color: var(--ok); }
+  .pill.cancelled { background: var(--warn-soft); color: var(--warn); }
   .pill.failed { background: var(--danger-soft); color: var(--danger); }
   .dot {
     width: 7px; height: 7px; border-radius: 50%; background: currentColor;
@@ -505,6 +506,7 @@ async function renderCollect() {
       <div class="card-head">
         <div class="title"><h3 style="margin:0">运行状态</h3></div>
         <span id="run-pill"></span>
+        <button class="btn danger" id="go-stop" hidden>停止</button>
       </div>
       <div class="log" id="run-log"></div>
       <div class="meta" id="run-summary" style="margin-top:10px"></div>
@@ -548,6 +550,16 @@ async function renderCollect() {
       pollRun();
     } catch (err) { showError(err); }
   };
+  $("#go-stop").onclick = async (e) => {
+    // 只是置一个标志。任务当前多半正阻塞在一次 LLM 调用或一次详情页抓取
+    // 上（各自 180 秒超时），停止会在**当前这个岗位跑完之后**生效。按钮
+    // 立刻变成不可点 + 「正在停止…」，是为了不让人以为点击没生效而连点。
+    e.target.disabled = true;
+    clearError();
+    try { await send("/api/run/stop", "POST", {}); }
+    catch (err) { e.target.disabled = false; return showError(err); }
+    pollRun();
+  };
 
   await pollRun();
 }
@@ -562,6 +574,7 @@ const SUMMARY_LABELS = {
   listed: "列表条数", new: "新增", gated_out: "门禁刷掉", detail_fetched: "抓取详情",
   scored: "已打分", failed: "打分失败", pitch_failed: "话术失败",
   enqueued: "新入队", already_queued: "队列里已有", retracted: "撤回过期招呼",
+  remaining: "被停止时还剩",
 };
 
 /* 轮询后台任务状态。只在「运行中」时继续排下一次——任务结束后停表，
@@ -580,9 +593,25 @@ async function pollRun() {
     log.innerHTML = task.lines.map(l => `${esc(l)}\n`).join("");
     if (pinned) log.scrollTop = log.scrollHeight;
 
-    const label = { running: "运行中", done: "已完成", failed: "失败" }[task.status] || task.status;
+    // 「正在停止」不是一个后端状态，而是 running + 已请求停止。分开显示很
+    // 要紧：这段时间可能长达一整个岗位（两三次 LLM 调用），不说清楚的话
+    // 人会以为停止按钮没生效，然后去点第二次、或者直接杀掉进程。
+    const stopping = task.status === "running" && task.stop_requested;
+    const label = stopping ? "正在停止"
+      : ({ running: "运行中", done: "已完成", cancelled: "已停止", failed: "失败" }[task.status] || task.status);
+    const pillClass = stopping ? "running" : task.status;
     $("#run-pill").innerHTML =
-      `<span class="pill ${esc(task.status)}">${task.status === "running" ? `<i class="dot"></i>` : ""}${esc(label)} · ${esc(task.label)}</span>`;
+      `<span class="pill ${esc(pillClass)}">${task.status === "running" ? `<i class="dot"></i>` : ""}${esc(label)} · ${esc(task.label)}</span>`;
+
+    const stopBtn = $("#go-stop");
+    if (stopBtn) {
+      stopBtn.hidden = task.status !== "running";
+      stopBtn.disabled = stopping;
+      stopBtn.textContent = stopping ? "正在停止…" : "停止";
+      stopBtn.title = stopping
+        ? "已经收到停止请求，当前这个岗位跑完就会停下（LLM 调用没法中途掐断）"
+        : "会在当前这个岗位跑完之后停下，已经处理完的都已入库";
+    }
 
     // 只显示非零的计数。一整行「已打分 0 · 门禁刷掉 0 · 打分失败 0 …」
     // 读起来全是噪音，真正有信息的那几个数字反而被埋掉了。
@@ -593,6 +622,9 @@ async function pollRun() {
         parts.push(`${esc(SUMMARY_LABELS[k])} ${esc(v)}`);
       }
       if (!parts.length && task.status === "done") parts.push("这一轮没有需要处理的岗位");
+      if (task.status === "cancelled") {
+        parts.unshift("已被人工停止；没轮到的岗位下次跑还会被捡起来");
+      }
     }
     const errs = (task.summary && task.summary.errors) || [];
     if (errs.length) parts.push(`<span class="gap">${esc(errs.length)} 条出错，详见上面的日志</span>`);
@@ -611,7 +643,7 @@ function drawFloating(task) {
   const box = $("#float");
   if (!task || task.status !== "running" || view === "collect") { box.innerHTML = ""; return; }
   box.innerHTML = `<div class="floating" id="go-run">
-      <span class="pill running"><i class="dot"></i>${esc(task.label)} 运行中</span>
+      <span class="pill running"><i class="dot"></i>${esc(task.label)} ${esc(task.stop_requested ? "正在停止" : "运行中")}</span>
       <span class="meta">查看</span></div>`;
   $("#go-run").onclick = () => switchTo("collect");
 }

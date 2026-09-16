@@ -29,7 +29,7 @@ def runner():
 
 
 def test_a_finished_task_records_its_summary(runner):
-    runner.start("score", "打分", lambda note: (note("干活"), {"scored": 3})[1])
+    runner.start("score", "打分", lambda note, stop: (note("干活"), {"scored": 3})[1])
     runner.join(timeout=5)
     snap = runner.snapshot()
     assert snap["status"] == "done"
@@ -41,7 +41,7 @@ def test_a_finished_task_records_its_summary(runner):
 def test_a_crashing_task_lands_in_failed_not_stuck_in_running(runner):
     """异常逃出后台线程只会打进 stderr，面板会永远停在「运行中」。"""
 
-    def boom(note):
+    def boom(note, stop):
         note("开始")
         raise RuntimeError("浏览器没开")
 
@@ -58,7 +58,7 @@ def test_even_a_baseexception_leaves_a_terminal_state(runner):
     """KeyboardInterrupt/SystemExit 不是 Exception 的子类。只 except
     Exception 的话，这两种照样会让任务永远卡在「运行中」。"""
 
-    def boom(note):
+    def boom(note, stop):
         raise KeyboardInterrupt()
 
     runner.start("score", "打分", boom)
@@ -69,10 +69,10 @@ def test_even_a_baseexception_leaves_a_terminal_state(runner):
 
 def test_only_one_task_at_a_time(runner):
     release = threading.Event()
-    runner.start("collect", "第一个", lambda note: (release.wait(5), {})[1])
+    runner.start("collect", "第一个", lambda note, stop: (release.wait(5), {})[1])
     try:
         with pytest.raises(AlreadyRunning) as exc:
-            runner.start("score", "第二个", lambda note: {})
+            runner.start("score", "第二个", lambda note, stop: {})
         assert "第一个" in str(exc.value)
     finally:
         release.set()
@@ -81,9 +81,9 @@ def test_only_one_task_at_a_time(runner):
 
 
 def test_a_new_task_can_start_once_the_previous_one_finished(runner):
-    runner.start("collect", "第一个", lambda note: {})
+    runner.start("collect", "第一个", lambda note, stop: {})
     runner.join(timeout=5)
-    runner.start("score", "第二个", lambda note: {})
+    runner.start("score", "第二个", lambda note, stop: {})
     runner.join(timeout=5)
     assert runner.snapshot()["label"] == "第二个"
 
@@ -91,7 +91,7 @@ def test_a_new_task_can_start_once_the_previous_one_finished(runner):
 def test_log_is_capped_so_a_long_run_cannot_grow_without_bound(runner):
     from jobstar.panel.runner import MAX_LINES
 
-    def chatty(note):
+    def chatty(note, stop):
         for i in range(MAX_LINES + 50):
             note(f"第 {i} 条")
         return {}
@@ -109,7 +109,7 @@ def test_snapshot_is_a_copy_not_a_live_view(runner):
     是当时的副本，否则会撞上「迭代时被修改」。"""
     release = threading.Event()
 
-    def slow(note):
+    def slow(note, stop):
         note("一")
         release.wait(5)
         note("二")
@@ -211,7 +211,7 @@ def test_score_runs_the_pipeline_and_reports_counts(client, monkeypatch):
 
     monkeypatch.setattr(
         "jobstar.pipeline.run_score",
-        lambda conn, *, limit=None, on_progress=None: (
+        lambda conn, *, limit=None, on_progress=None, should_stop=None: (
             on_progress("80 分 · 后端开发"),
             ScoreReport(scored=1, enqueued=1),
         )[1],
@@ -255,7 +255,7 @@ def test_login_failure_aborts_the_whole_collect_run_and_says_so(client, monkeypa
 
     seen: list[str] = []
 
-    def fake_collect(conn, *, keyword, city_code, pages, on_progress=None):
+    def fake_collect(conn, *, keyword, city_code, pages, on_progress=None, should_stop=None):
         seen.append(keyword)
         raise LoginRequired("扫码登录已过期")
 
@@ -272,3 +272,99 @@ def test_login_failure_aborts_the_whole_collect_run_and_says_so(client, monkeypa
     assert task["status"] == "failed"
     assert "登录态失效" in task["error"]
     assert "登录态失效" in get_setting(client.conn, "last_collect_error")
+
+
+# --- 停止 -------------------------------------------------------------------
+#
+# 取消是协作式的：Python 没法安全地强杀线程，而任务多半正阻塞在一次 LLM
+# 调用或一次详情页抓取上。所以「停止」只能置标志，由任务自己在岗位边界上
+# 检查。下面这组盯住三件事：标志确实传到了 work；提前收工会被记成
+# cancelled 而不是 done；点了停止但其实已经跑完的，如实显示「已完成」。
+
+
+def test_work_sees_the_stop_flag(runner):
+    release = threading.Event()
+    saw: list[bool] = []
+
+    def work(note, should_stop):
+        saw.append(should_stop())   # 刚启动时不该是停止状态
+        release.wait(5)
+        saw.append(should_stop())   # 请求之后应当看得到
+        return {"stopped": should_stop()}
+
+    runner.start("score", "打分", work)
+    for _ in range(500):            # 等 work 真的跑起来
+        if runner.is_running() and saw:
+            break
+    assert runner.request_stop() is True
+    release.set()
+    runner.join(timeout=5)
+
+    assert saw == [False, True]
+    snap = runner.snapshot()
+    assert snap["status"] == "cancelled"
+    assert snap["stop_requested"] is True
+
+
+def test_finishing_normally_after_a_late_stop_click_still_says_done(runner):
+    """点停止的那一刻任务其实已经跑完了——这种情况必须如实显示「已完成」，
+    不能因为按过按钮就谎称中止（那会让人以为有岗位被跳过，跑去重跑）。"""
+    runner.start("score", "打分", lambda note, stop: {"scored": 3})
+    runner.join(timeout=5)
+    assert runner.request_stop() is False, "已经结束的任务没什么可停的"
+    assert runner.snapshot()["status"] == "done"
+
+
+def test_stop_request_does_not_leak_into_the_next_task(runner):
+    """取消事件必须每个任务一个。共用一个的话，上一轮点过停止，下一轮
+    一启动就被当成已取消。"""
+    release = threading.Event()
+    runner.start("collect", "第一个", lambda note, stop: (release.wait(5), {"stopped": True})[1])
+    for _ in range(500):
+        if runner.is_running():
+            break
+    runner.request_stop()
+    release.set()
+    runner.join(timeout=5)
+    assert runner.snapshot()["status"] == "cancelled"
+
+    seen: list[bool] = []
+    runner.start("score", "第二个", lambda note, stop: (seen.append(stop()), {})[1])
+    runner.join(timeout=5)
+    assert seen == [False], "新任务不该继承上一轮的取消标志"
+    assert runner.snapshot()["status"] == "done"
+    assert runner.snapshot()["stop_requested"] is False
+
+
+def test_stop_endpoint_reports_whether_anything_was_running(client, monkeypatch):
+    resp = client.post("/api/run/stop", json={}, headers=PANEL_HEADERS)
+    assert resp.status_code == 409
+    assert "没有正在跑的任务" in resp.json()["detail"]
+
+    called: list[int] = []
+    monkeypatch.setattr(client.runner, "request_stop", lambda: (called.append(1), True)[1])
+    assert client.post("/api/run/stop", json={}, headers=PANEL_HEADERS).status_code == 200
+    assert called == [1]
+
+
+def test_stop_endpoint_requires_the_panel_header(client):
+    assert client.post("/api/run/stop", json={}).status_code == 403
+
+
+def test_stop_endpoint_returns_immediately_even_though_the_task_keeps_going(client):
+    """/api/run/stop 只置标志就返回。在里面等后台线程收工的话，这次 HTTP
+    请求会被一次 LLM 调用挂住几十秒。"""
+    release = threading.Event()
+    client.runner.start("score", "打分", lambda note, stop: (release.wait(5), {"stopped": True})[1])
+    for _ in range(500):
+        if client.runner.is_running():
+            break
+    try:
+        assert client.post("/api/run/stop", json={}, headers=PANEL_HEADERS).status_code == 200
+        task = client.get("/api/run/status").json()["task"]
+        assert task["status"] == "running", "任务还没停下来，状态就该还是 running"
+        assert task["stop_requested"] is True, "面板靠这个显示「正在停止…」"
+    finally:
+        release.set()
+    client.runner.join(timeout=5)
+    assert client.get("/api/run/status").json()["task"]["status"] == "cancelled"
