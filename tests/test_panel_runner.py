@@ -368,3 +368,131 @@ def test_stop_endpoint_returns_immediately_even_though_the_task_keeps_going(clie
         release.set()
     client.runner.join(timeout=5)
     assert client.get("/api/run/status").json()["task"]["status"] == "cancelled"
+
+
+# --- 两阶段采集的 HTTP 层 ---------------------------------------------------
+
+
+def _seed_candidates(conn, n=3, passed=1):
+    for i in range(1, n + 1):
+        conn.execute(
+            "INSERT INTO jobs (platform, job_id, title, company, city, salary_raw, url) "
+            "VALUES ('boss', ?, ?, 'A公司', '杭州', '-K·薪', ?)",
+            (f"j{i}", f"后端{i}", f"https://x/job_detail/j{i}~.html"),
+        )
+        conn.execute(
+            "INSERT INTO gate_results (job_id, passed, reject_reason) VALUES (?, ?, ?)",
+            (f"j{i}", passed, None if passed else "城市不在白名单：北京"),
+        )
+    conn.commit()
+
+
+def test_candidates_lists_jobs_waiting_for_a_detail_page(client):
+    _seed_candidates(client.conn, 2)
+    client.conn.execute("UPDATE jobs SET detail_fetched=1 WHERE job_id='j1'")
+    client.conn.commit()
+
+    items = client.get("/api/candidates").json()["items"]
+    assert [i["job_id"] for i in items] == ["j2"], "已经抓过详情的不该再出现在待选里"
+    assert items[0]["passed"] is True
+    assert items[0]["title"] == "后端2"
+
+
+def test_candidates_exposes_the_pre_gate_verdict_so_the_panel_can_mark_it(client):
+    _seed_candidates(client.conn, 1, passed=0)
+    (item,) = client.get("/api/candidates").json()["items"]
+    assert item["passed"] is False
+    assert "北京" in item["reject_reason"]
+
+
+def test_detail_run_only_opens_the_selected_jobs(client, monkeypatch):
+    _seed_candidates(client.conn, 5)
+    opened: list[str] = []
+    monkeypatch.setattr(
+        "jobstar.collector.boss.fetch_detail",
+        lambda url: (opened.append(url), {"raw_jd": "JD 全文"})[1],
+    )
+
+    resp = client.post(
+        "/api/run/detail", json={"job_ids": ["j2", "j4"]}, headers=PANEL_HEADERS
+    )
+    assert resp.status_code == 200
+    client.runner.join(timeout=10)
+
+    task = client.get("/api/run/status").json()["task"]
+    assert task["status"] == "done", task.get("error")
+    assert task["summary"]["detail_fetched"] == 2
+    assert len(opened) == 2, "没点名的三个一个都不该被打开"
+
+
+def test_selecting_a_pre_gated_job_flips_its_gate_and_says_so(client, monkeypatch):
+    """人工勾了被刷掉的岗位 = 明确覆盖规则。不翻门禁的话，抓回来的详情页
+    永远等不到打分，勾选等于什么都没发生。这次覆盖必须写进日志。"""
+    _seed_candidates(client.conn, 1, passed=0)
+    monkeypatch.setattr(
+        "jobstar.collector.boss.fetch_detail", lambda url: {"raw_jd": "JD 全文"}
+    )
+
+    client.post("/api/run/detail", json={"job_ids": ["j1"]}, headers=PANEL_HEADERS)
+    client.runner.join(timeout=10)
+
+    task = client.get("/api/run/status").json()["task"]
+    assert any("人工覆盖预门禁" in line for line in task["lines"])
+    assert any("城市不在白名单：北京" in line for line in task["lines"])
+    assert client.conn.execute(
+        "SELECT passed FROM gate_results WHERE job_id='j1'"
+    ).fetchone()["passed"] == 1
+
+
+@pytest.mark.parametrize(
+    "body,message",
+    [
+        ({"job_ids": []}, "至少要选一个岗位"),
+        ({}, "至少要选一个岗位"),
+        ({"job_ids": ["", "  "]}, "非空字符串"),
+        ({"job_ids": [123]}, "非空字符串"),
+        ({"job_ids": [f"j{i}" for i in range(300)]}, "一次最多 200 个"),
+    ],
+)
+def test_detail_run_rejects_bad_selections_before_opening_a_browser(client, body, message):
+    resp = client.post("/api/run/detail", json=body, headers=PANEL_HEADERS)
+    assert resp.status_code == 400
+    assert message in resp.json()["detail"]
+    assert client.get("/api/run/status").json()["task"] is None
+
+
+def test_list_run_never_opens_a_detail_page(client, monkeypatch):
+    """拉列表这一步的全部意义就是零详情页请求。"""
+    monkeypatch.setattr(
+        "jobstar.collector.boss.fetch_list",
+        lambda **kw: [
+            {
+                "job_id": "j1", "url": "https://x/job_detail/j1~.html",
+                "title": "后端", "company": "A", "city": "杭州",
+                "salary_raw": "-K·薪", "hr_name": "", "tags": ["3-5年", "本科"],
+            }
+        ],
+    )
+
+    def boom(url):
+        raise AssertionError("拉列表阶段绝不该打开详情页")
+
+    monkeypatch.setattr("jobstar.collector.boss.fetch_detail", boom)
+
+    client.post(
+        "/api/run/list",
+        json={"keywords": ["后端"], "city": "101210100", "pages": 1},
+        headers=PANEL_HEADERS,
+    )
+    client.runner.join(timeout=10)
+
+    task = client.get("/api/run/status").json()["task"]
+    assert task["status"] == "done", task.get("error")
+    assert task["summary"]["listed"] == 1
+    assert task["summary"]["candidates"] == 1
+    assert client.get("/api/candidates").json()["items"][0]["job_id"] == "j1"
+
+
+def test_list_and_detail_endpoints_require_the_panel_header(client):
+    assert client.post("/api/run/list", json={"keywords": ["x"], "city": "1"}).status_code == 403
+    assert client.post("/api/run/detail", json={"job_ids": ["j1"]}).status_code == 403

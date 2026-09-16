@@ -223,14 +223,16 @@ UNESCAPED_ALLOWLIST = {
     "Date.now().toString(36)",
 }
 
-# 这些调用的参数不是 HTML：URL 路径片段，以及 showError/showOk 的纯文本
-# 参数——那两个函数自己会 esc()，在这里重复转义反而会把 & 显示成 &amp;。
+# 这些写入口不产生 HTML：URL 路径片段；showError/showOk 的纯文本参数（那两个
+# 函数自己会 esc()，在这里重复转义反而会把 & 显示成 &amp;）；以及 textContent
+# ——赋给它的字符串永远按纯文本处理，不经过 HTML 解析器，是天然安全的出口。
 NON_HTML_SINKS = (
     "api(`/api/",
     "send(`/api/",
     "showError(`",
     "showOk(`",
     "alert(`",
+    ".textContent =",
 )
 
 # 本文件的命名约定：以 Html 结尾的变量/函数，装的（返回的）已经是转义过的
@@ -395,3 +397,24 @@ def test_the_panel_says_stopping_is_not_instant():
     assert "正在停止" in poll, "没有区分「运行中」和「正在停止」"
     assert "stop_requested" in poll, "正在停止的判断没有用后端的 stop_requested"
     assert "跑完" in poll, "没有说清停止会在当前这个岗位跑完之后生效"
+
+
+def test_the_collect_page_is_two_steps_with_a_selectable_candidate_list():
+    """采集拆成「拉列表 → 人工挑 → 抓详情」。详情页请求是整条链路上唯一
+    按岗位数量增长、真正打在 Boss 上的动作，数量必须由人决定。"""
+    view = HTML[HTML.index("async function renderCollect()") :]
+    view = view[: view.index("\nfunction drawTags()")]
+    assert 'id="go-list"' in view and "/api/run/list" in view, "没有「只拉列表」这一步"
+    assert 'id="go-detail"' in view and "/api/run/detail" in view, "没有「抓选中的」这一步"
+    assert 'id="cand-all"' in view and 'id="cand-none"' in view, "没有全选/全不选"
+    assert "不会打开任何详情页" in view, "没有说清拉列表这一步不发详情页请求"
+
+
+def test_the_candidate_list_marks_pre_gated_jobs_but_still_lets_you_pick_them():
+    """被预门禁刷掉的也要显示出来——只显示幸存者的话，人会以为列表页
+    就只有这几条。默认不勾选，但可以手动勾（人工判断压过规则）。"""
+    draw = HTML[HTML.index("async function drawCandidates()") :]
+    draw = draw[: draw.index("\nconst candidateBoxes")]
+    assert "预门禁刷掉" in draw, "没有标出被刷掉的岗位"
+    assert "reject_reason" in draw, "没有显示被刷掉的原因"
+    assert 'out ? "" : "checked"' in draw, "被刷掉的应当默认不勾选、但仍可勾"

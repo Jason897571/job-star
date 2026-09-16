@@ -196,6 +196,21 @@
   }
   .tag button:hover { opacity: 1; }
 
+  /* ---- 候选列表 ---- */
+  .cand {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; margin: 0 0 6px;
+    border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface-2); cursor: pointer;
+  }
+  .cand:hover { border-color: var(--accent); }
+  .cand input { width: auto; flex: none; margin: 0; }
+  .cand-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .cand-title { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
+  .cand-main b { font-size: 14px; }
+  .cand.out { opacity: .62; }
+  .cand .badge { flex: none; }
+
   /* ---- 运行日志 ---- */
   .log {
     background: #0e1116; color: #cdd6e3;
@@ -478,13 +493,30 @@ async function renderCollect() {
       </div>
       <div class="meta">杭州 101210100 · 上海 101020100 · 北京 101010100 · 深圳 101280600 · 广州 101280100</div>
       <div class="row">
-        <button class="btn primary" id="go-collect">开始采集</button>
-        <span class="meta">列表页 → 预门禁刷掉明显不合的 → 只给幸存者抓详情页</span>
+        <button class="btn primary" id="go-list">拉取列表</button>
+        <span class="meta">只翻列表页，<b>不会打开任何详情页</b>；拉完在下面挑要抓哪些</span>
       </div>
     </div>
 
     <div class="card">
-      <h3>二、归一化 + 门禁 + 打分</h3>
+      <div class="card-head">
+        <div class="title">
+          <h3 style="margin:0">二、挑要抓详情页的岗位</h3>
+          <div class="meta" id="cand-hint"></div>
+        </div>
+        <span id="cand-count" class="meta"></span>
+      </div>
+      <div id="cand-list"></div>
+      <div class="row">
+        <button class="btn" id="cand-all">全选</button>
+        <button class="btn quiet" id="cand-none">全不选</button>
+        <div class="spacer"></div>
+        <button class="btn primary" id="go-detail" disabled>抓选中的详情页</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>三、归一化 + 门禁 + 打分</h3>
       <p class="meta" style="margin-top:0">每个岗位两轮 LLM 调用。分数达到阈值才会生成待确认的招呼；
         阈值没设时一条都不生成，这是冷启动期的保险。</p>
       <div class="grid c2">
@@ -525,12 +557,12 @@ async function renderCollect() {
     if (i !== undefined) { keywords.splice(Number(i), 1); drawTags(); }
   });
 
-  $("#go-collect").onclick = async () => {
+  $("#go-list").onclick = async () => {
     clearError();
     const pending = $("#kw").value.trim();   // 还没按回车的那个也算数
     const list = pending && !keywords.includes(pending) ? [...keywords, pending] : keywords;
     try {
-      await send("/api/run/collect", "POST", {
+      await send("/api/run/list", "POST", {
         keywords: list,
         city: $("#city").value.trim(),
         pages: Number($("#pages").value) || 1,
@@ -539,6 +571,20 @@ async function renderCollect() {
       pollRun();
     } catch (err) { showError(err); }
   };
+
+  $("#cand-all").onclick = () => setAllCandidates(true);
+  $("#cand-none").onclick = () => setAllCandidates(false);
+  $("#cand-list").addEventListener("change", updateSelectionCount);
+  $("#go-detail").onclick = async () => {
+    clearError();
+    const ids = selectedCandidates();
+    if (!ids.length) return;
+    try {
+      await send("/api/run/detail", "POST", { job_ids: ids });
+      pollRun();
+    } catch (err) { showError(err); }
+  };
+  await drawCandidates();
   $("#go-score").onclick = async () => {
     clearError();
     const raw = $("#limit").value.trim();
@@ -570,11 +616,67 @@ function drawTags() {
   ).join("");
 }
 
+/* ---- 候选列表：拉到列表页、还没抓详情的岗位 ---- */
+
+async function drawCandidates() {
+  const box = $("#cand-list");
+  if (!box) return;
+  const { items } = await api("/api/candidates");
+
+  const passed = items.filter(i => i.passed !== false).length;
+  $("#cand-hint").innerHTML = items.length
+    ? `详情页请求是整条链路上唯一按岗位数量增长、真正打在 Boss 上的动作 —— 这一步由你决定量。`
+      + `<br>薪资这一列基本是空的：Boss 列表页用反爬字体把数字抠掉了，真实薪资要抓了详情页才有。`
+    : "";
+  $("#cand-count").innerHTML = items.length
+    ? `${esc(items.length)} 条待选（预门禁通过 ${esc(passed)}）` : "";
+
+  if (!items.length) {
+    box.innerHTML = `<div class="empty">还没有待选的岗位。<br>先在上面填关键词、点「拉取列表」。</div>`;
+    updateSelectionCount();
+    return;
+  }
+
+  box.innerHTML = items.map(i => {
+    const out = i.passed === false;
+    // 薪资多半是空的（列表页反爬字体），空的时候连分隔点都不要
+    const salaryHtml = i.salary_raw ? ` · ${esc(i.salary_raw)}` : "";
+    return `
+    <label class="cand${out ? " out" : ""}">
+      <input type="checkbox" data-cand="${esc(i.job_id)}" ${out ? "" : "checked"}>
+      <span class="cand-main">
+        <span class="cand-title"><b>${esc(i.title)}</b><span class="meta">· ${esc(i.company)}</span></span>
+        <span class="meta">${esc(i.city)}${salaryHtml}
+          · <a href="${safeHref(i.url)}" target="_blank" rel="noopener">原页面</a></span>
+      </span>
+      ${out ? `<span class="badge gap">预门禁刷掉：${esc(i.reject_reason)}</span>` : ""}
+    </label>`;
+  }).join("");
+  updateSelectionCount();
+}
+
+const candidateBoxes = () => document.querySelectorAll("[data-cand]");
+const selectedCandidates = () =>
+  [...candidateBoxes()].filter(b => b.checked).map(b => b.dataset.cand);
+
+function setAllCandidates(on) {
+  candidateBoxes().forEach(b => { b.checked = on; });
+  updateSelectionCount();
+}
+
+function updateSelectionCount() {
+  const btn = $("#go-detail");
+  if (!btn) return;
+  const n = selectedCandidates().length;
+  btn.disabled = n === 0;
+  btn.textContent = n ? `抓选中的 ${n} 个详情页` : "抓选中的详情页";
+}
+
 const SUMMARY_LABELS = {
   listed: "列表条数", new: "新增", gated_out: "门禁刷掉", detail_fetched: "抓取详情",
   scored: "已打分", failed: "打分失败", pitch_failed: "话术失败",
   enqueued: "新入队", already_queued: "队列里已有", retracted: "撤回过期招呼",
-  remaining: "被停止时还剩",
+  candidates: "待选", already_fetched: "之前已抓过", remaining: "被停止时还剩",
 };
 
 /* 轮询后台任务状态。只在「运行中」时继续排下一次——任务结束后停表，
@@ -635,7 +737,8 @@ async function pollRun() {
   if (task && task.status === "running") {
     pollTimer = setTimeout(pollRun, 1500);
   } else if (task && log) {
-    await bar();   // 跑完了，顶部计数要跟上
+    await bar();              // 跑完了，顶部计数要跟上
+    await drawCandidates();   // 拉完列表会多出候选，抓完详情候选会减少
   }
 }
 

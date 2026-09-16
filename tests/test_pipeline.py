@@ -775,6 +775,163 @@ def test_run_collect_stops_before_opening_the_next_detail_page(conn):
     assert len(fetched) == 2, "第三个岗位不该再被打开"
     assert (report.stopped, report.detail_fetched) == (True, 2)
     assert report.remaining == 2
-    # 没轮到的岗位：列表页已经入库（save_jobs 在循环之前），但没有门禁结果
+    # 门禁结果是**全部**先算完的（run_list 阶段，纯计算不发请求），停止只
+    # 掐断详情页那一段。这样被停掉的岗位仍然带着门禁结论留在候选列表里，
+    # 人工回头能直接挑它们继续抓，不用重拉一遍列表页。
     assert conn.execute("SELECT COUNT(*) n FROM jobs").fetchone()["n"] == 4
-    assert conn.execute("SELECT COUNT(*) n FROM gate_results").fetchone()["n"] == 2
+    assert conn.execute("SELECT COUNT(*) n FROM gate_results").fetchone()["n"] == 4
+
+
+# --- 两阶段采集：先拉列表，人工挑，再抓详情 ---------------------------------
+#
+# 详情页请求是整条链路上唯一一个「按岗位数量线性增长、真正打在 Boss 上」的
+# 动作。拆成两段是为了让人在中间插一脚，决定要对谁发请求。
+
+
+def _listed(n=3, city="杭州"):
+    return [
+        {
+            "job_id": f"j{i}",
+            "url": f"https://x/job_detail/j{i}~.html",
+            "title": f"后端{i}",
+            "company": "A",
+            "city": city,
+            "salary_raw": "-K·薪",
+            "hr_name": "",
+            "tags": ["3-5年", "本科"],
+        }
+        for i in range(1, n + 1)
+    ]
+
+
+def test_run_list_never_opens_a_detail_page(conn):
+    """这是拆分的全部意义：拉列表这一步必须零详情页请求。"""
+    from jobstar.pipeline import run_list
+
+    report = run_list(
+        conn, keyword="后端", city_code="101210100", fetch_fn=lambda **kw: _listed(3)
+    )
+    assert (report.listed, report.new, report.candidates, report.gated_out) == (3, 3, 3, 0)
+    assert conn.execute(
+        "SELECT COUNT(*) n FROM jobs WHERE detail_fetched=1"
+    ).fetchone()["n"] == 0
+    # 门禁结论已经落库，候选列表就是靠它区分「待选」和「被刷掉」
+    assert conn.execute("SELECT COUNT(*) n FROM gate_results").fetchone()["n"] == 3
+
+
+def test_run_list_records_why_a_job_was_pre_gated_out(conn):
+    from jobstar.pipeline import run_list
+
+    report = run_list(
+        conn, keyword="后端", city_code="1", fetch_fn=lambda **kw: _listed(2, city="北京")
+    )
+    assert (report.candidates, report.gated_out) == (0, 2)
+    row = conn.execute("SELECT * FROM gate_results WHERE job_id='j1'").fetchone()
+    assert row["passed"] == 0
+    assert "北京" in row["reject_reason"], "候选列表要把理由显示给人看"
+
+
+def test_run_details_only_opens_the_jobs_it_was_given(conn):
+    from jobstar.pipeline import run_details, run_list
+
+    run_list(conn, keyword="后端", city_code="1", fetch_fn=lambda **kw: _listed(5))
+    opened: list[str] = []
+
+    report = run_details(
+        conn,
+        ["j2", "j4"],
+        detail_fn=lambda url: (opened.append(url), {"raw_jd": "JD 全文"})[1],
+    )
+
+    assert len(opened) == 2, "没点名的岗位一个都不该被打开"
+    assert all("j2" in u or "j4" in u for u in opened)
+    assert report.fetched == 2
+    fetched = {
+        r["job_id"]
+        for r in conn.execute("SELECT job_id FROM jobs WHERE detail_fetched=1")
+    }
+    assert fetched == {"j2", "j4"}
+
+
+def test_run_details_does_not_reopen_a_job_it_already_has(conn):
+    """重复请求既浪费，也是白给的风控信号。"""
+    from jobstar.pipeline import run_details, run_list
+
+    run_list(conn, keyword="后端", city_code="1", fetch_fn=lambda **kw: _listed(2))
+    opened: list[str] = []
+    detail_fn = lambda url: (opened.append(url), {"raw_jd": "JD"})[1]  # noqa: E731
+
+    run_details(conn, ["j1"], detail_fn=detail_fn)
+    report = run_details(conn, ["j1", "j2"], detail_fn=detail_fn)
+
+    assert len(opened) == 2, "j1 不该被打开第二次"
+    assert (report.fetched, report.skipped) == (1, 1)
+
+
+def test_run_details_can_be_stopped_between_jobs(conn):
+    from jobstar.pipeline import run_details, run_list
+
+    run_list(conn, keyword="后端", city_code="1", fetch_fn=lambda **kw: _listed(5))
+    opened: list[str] = []
+
+    report = run_details(
+        conn,
+        ["j1", "j2", "j3", "j4", "j5"],
+        detail_fn=lambda url: (opened.append(url), {"raw_jd": "JD"})[1],
+        should_stop=lambda: len(opened) >= 2,
+    )
+    assert len(opened) == 2
+    assert (report.stopped, report.remaining, report.fetched) == (True, 3, 2)
+
+
+def test_override_gate_flips_a_pre_gated_job_so_scoring_can_reach_it(conn):
+    """人工在候选列表里手动勾了被刷掉的岗位 = 明确要覆盖规则。只抓详情页
+    是不够的：run_score 要求 gate_results.passed=1，不翻门禁的话抓回来的
+    详情永远等不到打分，勾选等于什么都没发生。"""
+    from jobstar.pipeline import override_gate, run_list
+
+    run_list(conn, keyword="后端", city_code="1", fetch_fn=lambda **kw: _listed(2, city="北京"))
+    flipped = override_gate(conn, ["j1"])
+
+    assert len(flipped) == 1
+    assert "城市不在白名单：北京" in flipped[0], "翻转要把原因带出来写进日志"
+    row = conn.execute("SELECT * FROM gate_results WHERE job_id='j1'").fetchone()
+    assert (row["passed"], row["reject_reason"]) == (1, None)
+    assert conn.execute(
+        "SELECT status FROM jobs WHERE job_id='j1'"
+    ).fetchone()["status"] == "new"
+    # 没点名的那个一动不动
+    assert conn.execute(
+        "SELECT passed FROM gate_results WHERE job_id='j2'"
+    ).fetchone()["passed"] == 0
+
+
+def test_override_gate_leaves_jobs_that_passed_alone(conn):
+    """已经通过的岗位不在覆盖范围里——否则重复勾选会把正常的门禁记录也
+    改写一遍，白白抹掉信息。"""
+    from jobstar.pipeline import override_gate, run_list
+
+    run_list(conn, keyword="后端", city_code="1", fetch_fn=lambda **kw: _listed(2))
+    assert override_gate(conn, ["j1", "j2"]) == []
+
+
+def test_run_collect_still_does_the_whole_thing_in_one_go(conn):
+    """命令行走的是一把梭：拉列表 → 预门禁 → 给所有幸存者抓详情。拆分成
+    run_list + run_details 之后，`jobstar collect` 的行为不能变。"""
+    listed = _listed(3, city="杭州") + [
+        {**_listed(1, city="北京")[0], "job_id": "beijing", "title": "北京的岗位"}
+    ]
+    opened: list[str] = []
+
+    report = run_collect(
+        conn,
+        keyword="后端",
+        city_code="1",
+        fetch_fn=lambda **kw: listed,
+        detail_fn=lambda url: (opened.append(url), {"raw_jd": "JD"})[1],
+    )
+
+    assert (report.listed, report.new, report.gated_out) == (4, 4, 1)
+    assert report.detail_fetched == 3, "被预门禁刷掉的那个不该被打开"
+    assert len(opened) == 3
+    assert not any("beijing" in u for u in opened)

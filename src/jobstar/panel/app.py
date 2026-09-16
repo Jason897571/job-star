@@ -603,25 +603,9 @@ def _busy(exc: AlreadyRunning) -> HTTPException:
     return HTTPException(409, str(exc))
 
 
-@app.post("/api/run/stop", dependencies=[Depends(require_panel_request)])
-def run_stop(runner: TaskRunner = Depends(get_runner)) -> dict:
-    """请求停止正在跑的任务。
-
-    只置标志就返回，不等后台线程收工——任务当前多半正阻塞在一次 LLM 调用
-    或一次详情页抓取上（各自 180 秒超时），在这个请求里等会把 HTTP 也挂住。
-    面板靠轮询看到 `stop_requested` 为真、状态仍是 running，显示「正在停止…」。
-    """
-    if not runner.request_stop():
-        raise HTTPException(409, "现在没有正在跑的任务")
-    return {"ok": True}
-
-
-@app.post("/api/run/collect", dependencies=[Depends(require_panel_request)])
-def run_collect_task(
-    body: dict = Body(...),
-    conn: sqlite3.Connection = Depends(get_db),
-    runner: TaskRunner = Depends(get_runner),
-) -> dict:
+def _search_params(body: dict) -> tuple[list[str], str, int]:
+    """校验搜索条件。拉列表和一把梭采集共用——两处各写一份的话，迟早只有
+    一处会跟着改，另一处就成了绕过校验的后门。"""
     keywords = [
         k.strip() for k in (body.get("keywords") or []) if isinstance(k, str) and k.strip()
     ]
@@ -639,7 +623,166 @@ def run_collect_task(
         raise HTTPException(400, "页数必须是整数") from exc
     if not 1 <= pages <= 10:
         raise HTTPException(400, "页数只能是 1-10")
+    return keywords, city, pages
 
+
+@app.post("/api/run/stop", dependencies=[Depends(require_panel_request)])
+def run_stop(runner: TaskRunner = Depends(get_runner)) -> dict:
+    """请求停止正在跑的任务。
+
+    只置标志就返回，不等后台线程收工——任务当前多半正阻塞在一次 LLM 调用
+    或一次详情页抓取上（各自 180 秒超时），在这个请求里等会把 HTTP 也挂住。
+    面板靠轮询看到 `stop_requested` 为真、状态仍是 running，显示「正在停止…」。
+    """
+    if not runner.request_stop():
+        raise HTTPException(409, "现在没有正在跑的任务")
+    return {"ok": True}
+
+
+@app.get("/api/candidates")
+def candidates(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """已经拉到列表、但还没抓详情页的岗位，供面板做勾选。
+
+    `salary_raw` 在这一步基本是废的：Boss 列表页用反爬字体把数字抠掉了
+    （抓下来长这样 `-K·薪`），真实薪资只有详情页才有。照原样返回而不是
+    藏起来——藏起来人会以为是系统丢了字段。
+    """
+    rows = conn.execute(
+        "SELECT j.job_id, j.title, j.company, j.city, j.salary_raw, j.url, "
+        "       j.collected_at, g.passed, g.reject_reason "
+        "FROM jobs j LEFT JOIN gate_results g ON g.job_id = j.job_id "
+        "WHERE j.detail_fetched = 0 "
+        "ORDER BY j.collected_at DESC, j.id"
+    ).fetchall()
+    return {
+        "items": [
+            {
+                "job_id": r["job_id"],
+                "title": r["title"],
+                "company": r["company"],
+                "city": r["city"],
+                "salary_raw": r["salary_raw"],
+                "url": r["url"],
+                "collected_at": r["collected_at"],
+                # passed 为 None = 还没跑过预门禁（理论上不该出现，防御性保留）
+                "passed": None if r["passed"] is None else bool(r["passed"]),
+                "reject_reason": r["reject_reason"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/api/run/list", dependencies=[Depends(require_panel_request)])
+def run_list_task(
+    body: dict = Body(...),
+    conn: sqlite3.Connection = Depends(get_db),
+    runner: TaskRunner = Depends(get_runner),
+) -> dict:
+    """第一步：只拉列表页 + 跑预门禁，一个详情页请求都不发。"""
+    keywords, city, pages = _search_params(body)
+    set_setting(conn, "last_search", {"keywords": keywords, "city": city, "pages": pages})
+    label = f"{keywords[0]} 等 {len(keywords)} 个关键词" if len(keywords) > 1 else keywords[0]
+
+    def work(note, should_stop):
+        from jobstar.collector.boss import LoginRequired
+        from jobstar.pipeline import run_list
+
+        task_conn = get_conn(get_settings().db_path)
+        totals = {"listed": 0, "new": 0, "gated_out": 0, "candidates": 0,
+                  "stopped": False, "errors": []}
+        try:
+            for keyword in keywords:
+                if should_stop():
+                    totals["stopped"] = True
+                    note("已停止，剩下的关键词不再拉取")
+                    break
+                note(f"▶ 拉取「{keyword}」列表（{pages} 页）")
+                try:
+                    report = run_list(
+                        task_conn,
+                        keyword=keyword,
+                        city_code=city,
+                        pages=pages,
+                        on_progress=note,
+                    )
+                except LoginRequired as exc:
+                    set_setting(
+                        task_conn, "last_collect_error", f"Boss 登录态失效，已中止：{exc}"
+                    )
+                    set_setting(task_conn, "last_collect_at", _stamp())
+                    raise RuntimeError(
+                        f"Boss 登录态失效，已中止：{exc}。请在 Chrome 里重新扫码登录后再试"
+                    ) from exc
+                for key in ("listed", "new", "gated_out", "candidates"):
+                    totals[key] += getattr(report, key)
+                totals["errors"].extend(report.errors)
+            _record_collect_health(task_conn, totals)
+            note("列表拉完了。到下面的候选列表里挑要抓详情页的岗位。")
+            return totals
+        finally:
+            task_conn.close()
+
+    try:
+        return {"task": runner.start("list", f"拉列表：{label}", work)}
+    except AlreadyRunning as exc:
+        raise _busy(exc) from exc
+
+
+@app.post("/api/run/detail", dependencies=[Depends(require_panel_request)])
+def run_detail_task(
+    body: dict = Body(...),
+    runner: TaskRunner = Depends(get_runner),
+) -> dict:
+    """第二步：只对人工点名的岗位抓详情页。"""
+    job_ids = body.get("job_ids")
+    if not isinstance(job_ids, list) or not job_ids:
+        raise HTTPException(400, "至少要选一个岗位")
+    if not all(isinstance(j, str) and j.strip() for j in job_ids):
+        raise HTTPException(400, "job_ids 必须是非空字符串列表")
+    job_ids = [j.strip() for j in job_ids]
+    if len(job_ids) > 200:
+        # 一次点名 200 个以上，多半是误操作（比如全选了好几轮攒下来的候选）。
+        # 详情页请求是打在 Boss 上的真实流量，宁可让人分批。
+        raise HTTPException(400, f"一次最多 200 个，当前选了 {len(job_ids)} 个")
+
+    def work(note, should_stop):
+        from jobstar.pipeline import override_gate, run_details
+
+        task_conn = get_conn(get_settings().db_path)
+        try:
+            # 人工勾了被预门禁刷掉的岗位 = 明确要覆盖规则。不把门禁翻过来的话，
+            # 抓回来的详情页永远等不到打分，勾选等于什么都没发生。
+            flipped = override_gate(task_conn, job_ids)
+            for line in flipped:
+                note(f"人工覆盖预门禁：{line}")
+            note(f"▶ 开始抓 {len(job_ids)} 个岗位的详情页")
+            report = run_details(
+                task_conn, job_ids, on_progress=note, should_stop=should_stop
+            )
+            return {
+                "stopped": report.stopped,
+                "remaining": report.remaining,
+                "detail_fetched": report.fetched,
+                "already_fetched": report.skipped,
+                "errors": report.errors,
+            }
+        finally:
+            task_conn.close()
+
+    try:
+        return {"task": runner.start("detail", f"抓 {len(job_ids)} 个详情页", work)}
+    except AlreadyRunning as exc:
+        raise _busy(exc) from exc
+
+
+@app.post("/api/run/collect", dependencies=[Depends(require_panel_request)])
+def run_collect_task(
+    body: dict = Body(...),
+    conn: sqlite3.Connection = Depends(get_db),
+    runner: TaskRunner = Depends(get_runner),
+) -> dict:
+    keywords, city, pages = _search_params(body)
     # 记住这次的搜索条件，下次打开面板直接预填
     set_setting(conn, "last_search", {"keywords": keywords, "city": city, "pages": pages})
 

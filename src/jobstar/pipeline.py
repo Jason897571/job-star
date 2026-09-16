@@ -45,6 +45,28 @@ class CollectReport:
 
 
 @dataclass
+class ListReport:
+    """只拉列表 + 跑预门禁的结果。不含任何详情页请求。"""
+
+    listed: int = 0
+    new: int = 0
+    gated_out: int = 0
+    candidates: int = 0  # 过了预门禁、等着人工挑的
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DetailReport:
+    """按人工点名的岗位抓详情页的结果。"""
+
+    fetched: int = 0
+    skipped: int = 0  # 已经抓过了，不重复打开
+    stopped: bool = False
+    remaining: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ScoreReport:
     scored: int = 0
     gated_out: int = 0
@@ -123,6 +145,167 @@ def _gate_rules(conn: sqlite3.Connection) -> dict:
     return rules
 
 
+def run_list(
+    conn: sqlite3.Connection,
+    *,
+    keyword: str,
+    city_code: str,
+    pages: int = 1,
+    fetch_fn: Callable[..., list[dict]] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> ListReport:
+    """第一阶段：只拉列表页 + 跑预门禁，**一个详情页请求都不发**。
+
+    这一阶段和详情页阶段分开，是为了让人工在两者之间插一脚：先看到这一页
+    有哪些岗位，再挑要对谁发详情页请求。详情页请求是整条链路上唯一一个
+    「按岗位数量线性增长的、打在 Boss 服务器上的」动作，也是最该由人来
+    决定量的地方。
+
+    预门禁必须留在这一阶段：它要用列表页标签里的年限/学历（`item["tags"]`），
+    而那几个字段没有落进 jobs 表，出了这个函数就拿不到了。
+    """
+    from jobstar.collector import boss
+
+    fetch_fn = fetch_fn or boss.fetch_list
+    note = on_progress or (lambda _: None)
+
+    report = ListReport()
+    try:
+        items = fetch_fn(keyword=keyword, city_code=city_code, pages=pages)
+    except boss.CollectError as exc:
+        # fetch_list 把「零结果」和「页面被拦截」都当 CollectError 抛出
+        # （二者在采集器这一层无法区分）。这里不让异常继续往上炸穿多关键词
+        # 的调用方——一个关键词恰好没有匹配，不该中止整轮；调用方从
+        # report.errors 里能看到这条含糊的失败，自己判断要不要去核实。
+        report.errors.append(f"{keyword}: 采集失败或本关键词零结果：{exc}")
+        return report
+
+    report.listed = len(items)
+    report.new = boss.save_jobs(conn, items)
+    note(f"「{keyword}」列表 {report.listed} 条，新增 {report.new} 条")
+
+    rules = _gate_rules(conn)
+    for item in items:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (item["job_id"],)
+        ).fetchone()
+        if row is None or row["detail_fetched"]:
+            continue
+
+        req = prelim_requirements(row, item.get("tags"))
+        result = gate.check(req, rules, company=row["company"] or "")
+        gate.save_result(conn, row["job_id"], result)
+        if result.passed:
+            report.candidates += 1
+        else:
+            report.gated_out += 1
+            conn.execute(
+                "UPDATE jobs SET status='gated_out' WHERE job_id=?", (row["job_id"],)
+            )
+    conn.commit()
+    note(f"预门禁：{report.candidates} 条待选，{report.gated_out} 条被刷掉")
+    return report
+
+
+def override_gate(conn: sqlite3.Connection, job_ids: list[str]) -> list[str]:
+    """人工在候选列表里手动勾选了被预门禁刷掉的岗位。
+
+    光抓详情页是不够的：`run_score` 要求 `gate_results.passed = 1`，不把门禁
+    翻过来的话，强行采到的详情页永远等不到打分，勾选等于什么都没发生。这里
+    把门禁改判为通过，让「人工的判断压过规则」这件事真的生效。
+
+    返回被翻转的 job_id 和原先的拒绝理由，交给调用方写进日志——这是一次
+    人工覆盖规则的动作，不该悄悄发生。
+    """
+    flipped = []
+    for job_id in job_ids:
+        row = conn.execute(
+            "SELECT reject_reason FROM gate_results WHERE job_id = ? AND passed = 0",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        conn.execute(
+            "UPDATE gate_results SET passed = 1, reject_reason = NULL WHERE job_id = ?",
+            (job_id,),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = 'new' WHERE job_id = ?", (job_id,)
+        )
+        flipped.append(f"{job_id}（原本：{row['reject_reason']}）")
+    conn.commit()
+    return flipped
+
+
+def run_details(
+    conn: sqlite3.Connection,
+    job_ids: list[str],
+    *,
+    detail_fn: Callable[[str], dict] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> DetailReport:
+    """第二阶段：只对点名的岗位抓详情页。
+
+    `should_stop()` 为真时在**下一个岗位开始之前**收工——一个岗位要么详情
+    完整落库，要么根本没开始。
+    """
+    from jobstar.collector import boss
+
+    detail_fn = detail_fn or boss.fetch_detail
+    note = on_progress or (lambda _: None)
+    stop = should_stop or (lambda: False)
+
+    report = DetailReport()
+    for index, job_id in enumerate(job_ids):
+        if stop():
+            report.stopped = True
+            report.remaining = len(job_ids) - index
+            note(f"已停止，还有 {report.remaining} 条没抓（已抓到的都已入库）")
+            break
+
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            report.errors.append(f"{job_id}: 库里没有这个岗位")
+            continue
+        if row["detail_fetched"]:
+            # 已经抓过的不重复打开——重复请求既浪费也是白给的风控信号
+            report.skipped += 1
+            continue
+
+        try:
+            detail = detail_fn(row["url"])
+        except boss.LoginRequired:
+            # 登录态失效是会话级别的硬故障：不能当成这一条岗位的采集失败吞掉、
+            # 继续对下一个发详情页请求——那样只会拿一个已经失效的会话再打一堆
+            # 请求，攒出一屏迷惑性的单条错误，而不是一次响亮、立刻能看懂的
+            # “重新登录再跑”信号。让它照原样往外炸穿。
+            raise
+        except Exception as exc:
+            note(f"详情页抓取失败：{row['title']}（{exc}）")
+            report.errors.append(f"{job_id}: {exc}")
+            continue
+        boss.save_detail(conn, job_id, detail)
+        report.fetched += 1
+        note(f"已抓详情：{row['title']} · {row['company']}")
+
+    return report
+
+
+def pending_candidates(conn: sqlite3.Connection) -> list[str]:
+    """过了预门禁、还没抓详情页的岗位。`run_collect` 用它复原「一把梭」行为。"""
+    return [
+        r["job_id"]
+        for r in conn.execute(
+            "SELECT j.job_id FROM jobs j "
+            "JOIN gate_results g ON g.job_id = j.job_id AND g.passed = 1 "
+            "WHERE j.detail_fetched = 0 ORDER BY j.id"
+        )
+    ]
+
+
 def run_collect(
     conn: sqlite3.Connection,
     *,
@@ -134,81 +317,39 @@ def run_collect(
     on_progress: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> CollectReport:
-    """`on_progress` 每处理完一个岗位调用一次，给面板做进度条用。
+    """一把梭：拉列表 → 预门禁 → 给所有幸存者抓详情页。命令行走这条。
 
-    一轮采集要开真实浏览器逐条抓详情页，几分钟起步；没有逐条进度的话，
-    面板上就是一个几分钟不动、分不清「在跑」和「卡死」的转圈。CLI 不传
-    这个参数，行为完全不变。
-
-    `should_stop()` 为真时在**下一个岗位开始之前**收工。检查点刻意放在
-    循环顶部而不是中间：一个岗位要么完整走完（门禁结果 + 详情页都落库），
-    要么根本没开始，不会留下门禁写了、详情页没抓的半截状态。
+    面板走的是拆开的两步（run_list → 人工挑 → run_details），好让详情页
+    请求的数量由人决定。这里把两步接起来，保持 `jobstar collect` 的行为不变。
     """
-    from jobstar.collector import boss
-
-    fetch_fn = fetch_fn or boss.fetch_list
-    detail_fn = detail_fn or boss.fetch_detail
-    note = on_progress or (lambda _: None)
-    stop = should_stop or (lambda: False)
-
-    report = CollectReport()
-    try:
-        items = fetch_fn(keyword=keyword, city_code=city_code, pages=pages)
-    except boss.CollectError as exc:
-        # fetch_list 现在把「零结果」和「页面被拦截」都当 CollectError 抛出
-        # （二者在采集器这一层无法区分）。这里不让异常继续往上炸穿多关键词
-        # 的调用方——一个关键词恰好没有匹配，不该中止整轮采集；调用方从
-        # report.errors 里能看到这条含糊的失败，自己判断要不要去核实。
-        report.errors.append(f"{keyword}: 采集失败或本关键词零结果：{exc}")
+    listed = run_list(
+        conn,
+        keyword=keyword,
+        city_code=city_code,
+        pages=pages,
+        fetch_fn=fetch_fn,
+        on_progress=on_progress,
+    )
+    report = CollectReport(
+        listed=listed.listed,
+        new=listed.new,
+        gated_out=listed.gated_out,
+        errors=list(listed.errors),
+    )
+    if not listed.listed:
         return report
 
-    report.listed = len(items)
-    report.new = boss.save_jobs(conn, items)
-    note(f"「{keyword}」列表 {report.listed} 条，新增 {report.new} 条")
-
-    rules = _gate_rules(conn)
-
-    for index, item in enumerate(items):
-        if stop():
-            report.stopped = True
-            report.remaining = len(items) - index
-            note(f"已停止，还有 {report.remaining} 条没处理（已抓到的都已入库）")
-            break
-
-        row = conn.execute(
-            "SELECT * FROM jobs WHERE job_id = ?", (item["job_id"],)
-        ).fetchone()
-        if row is None or row["detail_fetched"]:
-            continue
-
-        req = prelim_requirements(row, item.get("tags"))
-        result = gate.check(req, rules, company=row["company"] or "")
-        gate.save_result(conn, row["job_id"], result)
-        if not result.passed:
-            note(f"预门禁刷掉：{row['title']}（{result.reject_reason}）")
-            report.gated_out += 1
-            conn.execute(
-                "UPDATE jobs SET status='gated_out' WHERE job_id=?", (row["job_id"],)
-            )
-            conn.commit()
-            continue
-
-        try:
-            detail = detail_fn(row["url"])
-        except boss.LoginRequired:
-            # 登录态失效是会话级别的硬故障：不能当成这一条岗位的采集失败吞掉、
-            # 继续对下一个门禁幸存者发详情页请求——那样只会拿一个已经失效的
-            # 会话再打一堆请求，攒出一屏迷惑性的单条错误，而不是一次响亮、
-            # 立刻能看懂的“重新登录再跑”信号。让它照原样往外炸穿。
-            raise
-        except Exception as exc:
-            note(f"详情页抓取失败：{row['title']}（{exc}）")
-            report.errors.append(f"{row['job_id']}: {exc}")
-            continue
-        boss.save_detail(conn, row["job_id"], detail)
-        report.detail_fetched += 1
-        note(f"已抓详情：{row['title']} · {row['company']}")
-
+    detail = run_details(
+        conn,
+        pending_candidates(conn),
+        detail_fn=detail_fn,
+        on_progress=on_progress,
+        should_stop=should_stop,
+    )
+    report.detail_fetched = detail.fetched
+    report.stopped = detail.stopped
+    report.remaining = detail.remaining
+    report.errors.extend(detail.errors)
     return report
 
 
