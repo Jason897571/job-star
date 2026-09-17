@@ -935,3 +935,46 @@ def test_run_collect_still_does_the_whole_thing_in_one_go(conn):
     assert report.detail_fetched == 3, "被预门禁刷掉的那个不该被打开"
     assert len(opened) == 3
     assert not any("beijing" in u for u in opened)
+
+
+def test_the_pre_gate_can_now_reject_on_salary_before_any_detail_request(conn):
+    """这是薪资解码这件事的**全部意义**。
+
+    Boss 列表页把薪资数字换成了私用区码位，此前一路存进库都是乱码，
+    `parse_salary_raw` 抽不出数字，预门禁的 salary_min 规则从来没生效过——
+    设计文档 §5.4 指望靠它把详情页请求压到 1/5，实际上一条都没刷掉。
+    解码接上之后，薪资在**抓详情页之前**就可读，这条规则才真正开始省请求。
+
+    这里从页面原始形状喂进去（私用区码位 + 「市·区·商圈」），走完
+    normalize_list_item → decode_salaries → 预门禁 整条链路。
+    """
+    from jobstar.collector.parse import decode_salaries, normalize_list_item
+    from jobstar.pipeline import run_list
+
+    def pua(text):
+        return "".join(chr(0xE031 + int(c)) if c.isdigit() else c for c in text)
+
+    raw_page = [
+        {"url": "/job_detail/rich~.html", "title": "高薪岗位", "company": "A",
+         "city": "杭州·滨江区·长河", "salary": pua("40-70K·16薪"), "hr": "",
+         "tags": ["3-5年", "本科"]},
+        {"url": "/job_detail/poor~.html", "title": "低薪岗位", "company": "B",
+         "city": "杭州·滨江区·长河", "salary": pua("8-12K"), "hr": "",
+         "tags": ["3-5年", "本科"]},
+    ]
+
+    def fake_fetch(**kwargs):   # 和真实 fetch_list 一样：归一化之后整批解码
+        return decode_salaries([normalize_list_item(r) for r in raw_page])
+
+    report = run_list(conn, keyword="后端", city_code="1", fetch_fn=fake_fetch)
+
+    assert (report.candidates, report.gated_out) == (1, 1)
+    assert conn.execute(
+        "SELECT salary_raw FROM jobs WHERE job_id='rich'"
+    ).fetchone()["salary_raw"] == "40-70K·16薪", "存进库的应当是解好的明文"
+    rejected = conn.execute("SELECT * FROM gate_results WHERE job_id='poor'").fetchone()
+    assert rejected["passed"] == 0
+    assert "薪资" in rejected["reject_reason"]
+    assert conn.execute(
+        "SELECT COUNT(*) n FROM jobs WHERE detail_fetched=1"
+    ).fetchone()["n"] == 0, "整个过程一个详情页请求都没发——省下的正是这些"

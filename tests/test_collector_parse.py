@@ -7,6 +7,8 @@ from jobstar.collector.parse import (
     clean_text,
     dedup,
     extract_job_id,
+    decode_obfuscated_salary,
+    decode_salaries,
     normalize_list_item,
     parse_coords,
 )
@@ -131,3 +133,99 @@ def test_parse_coords_refuses_anything_it_cannot_trust(raw):
     """距离宁可不显示，也不能显示一个错的。返回 None 而不是 (0,0) 或猜一个：
     后两种会被下游当成真实坐标，算出一堆看起来精确的假距离。"""
     assert parse_coords(raw) is None
+
+
+# --- 列表页薪资的字体混淆 ---
+#
+# 数字被换成 Unicode 私用区码位，靠 kanzhun-mix 渲染成人眼可读的数字。
+# innerText 拿到的就是这些码位，看起来像 "-K·薪"——数字一直在，只是不是
+# ASCII。映射 0xE031+n → n 是 2026-09-16 逆向出来的，在两个独立会话上
+# 各验证过一遍（31/31）。
+
+
+def _pua(text: str) -> str:
+    """把 ASCII 数字换成对应的私用区码位，模拟页面上真实拿到的串。"""
+    return "".join(chr(0xE031 + int(ch)) if ch.isdigit() else ch for ch in text)
+
+
+@pytest.mark.parametrize(
+    "plain",
+    ["25-45K·14薪", "30-50K", "20-30K·16薪", "65-95K·16薪", "8-12K"],
+)
+def test_obfuscated_salary_decodes_back_to_plaintext(plain):
+    assert decode_obfuscated_salary(_pua(plain)) == plain
+
+
+def test_a_real_captured_string_decodes(): 
+    """2026-09-16 从真实列表页抓到的原串。"""
+    assert decode_obfuscated_salary("-K·薪") == "20-30K·16薪"
+
+
+@pytest.mark.parametrize(
+    "raw,why",
+    [
+        ("-K", "出现没见过的码位 → 映射可能已经变了"),
+        (_pua("45-25K"), "下限大于上限 → 解出来的数字不可信"),
+        (_pua("0-30K"), "下限是 0"),
+        ("500-1000元/天", "日薪，不是本解码器认识的形状"),
+        ("面议", "根本没有数字"),
+        ("", "空串"),
+    ],
+)
+def test_untrustworthy_salaries_come_back_as_none(raw, why):
+    """解不出来就当「不知道薪资」。门禁对字段缺失一律放过，于是退化成改这版
+    之前的行为；而一个解错的数字会让门禁照着假数据筛掉真岗位。"""
+    assert decode_obfuscated_salary(raw) is None, why
+
+
+def test_an_impossible_month_count_is_rejected():
+    """映射平移之后 `25-45K·14薪` 会解成 `36-56K·25薪`——形状合法、数字看着
+    也正常，只有「25薪」荒谬。月数这道闸是单条校验里唯一挡得住它的东西。"""
+    rotated = "".join(chr(ord(ch) + 1) if 0xE031 <= ord(ch) <= 0xE03A else ch
+                      for ch in _pua("25-45K·14薪"))
+    assert decode_obfuscated_salary(rotated) is None
+
+
+def _item(salary, job_id="abc123"):
+    return normalize_list_item(
+        {"url": f"/job_detail/{job_id}~.html", "title": "后端",
+         "city": "杭州·滨江区", "salary": salary}
+    )
+
+
+def test_a_page_of_salaries_is_decoded_so_the_pre_gate_can_use_them():
+    """这是整件事的意义：薪资在列表页就能读，预门禁因此能在**抓详情页之前**
+    按薪资刷掉岗位——那是唯一能省下页面请求的地方。"""
+    items = decode_salaries([
+        _item(_pua("25-45K·14薪"), "a"), _item(_pua("30-50K"), "b"),
+        _item("面议", "c"),
+    ])
+    assert [i["salary_raw"] for i in items] == ["25-45K·14薪", "30-50K", "面议"]
+
+
+def test_a_rotated_mapping_makes_the_whole_page_fall_back_to_raw():
+    """单条校验挡不住「整套映射被换了」：平移后 `30-50K` 变成 `41-61K`，
+    形状和数值都挑不出毛病。但一整页里带「薪」的那些会解出不可能的月数而
+    失败——成功率掉下去，就该整批不信，而不是把混着真假的结果交出去。"""
+    def rot(t):
+        return "".join(chr(ord(c) + 1) if 0xE031 <= ord(c) <= 0xE03A else c
+                       for c in _pua(t))
+    raws = [rot("25-45K·14薪"), rot("30-60K·16薪"), rot("20-30K·13薪"), rot("30-50K")]
+    items = decode_salaries([_item(r, f"j{i}") for i, r in enumerate(raws)])
+    assert [i["salary_raw"] for i in items] == raws, "整批退回原串，一条都不采信"
+
+
+def test_a_page_where_most_decode_is_trusted_even_if_one_is_odd():
+    """一两条解不出来是常态（面议、日薪）。不能因为个别失败就否定整页。"""
+    items = decode_salaries([
+        _item(_pua("25-45K·14薪"), "a"), _item(_pua("30-50K"), "b"),
+        _item(_pua("20-40K·15薪"), "c"), _item("-K", "d"),
+    ])
+    assert items[0]["salary_raw"] == "25-45K·14薪"
+    assert items[3]["salary_raw"] == "-K", "解不出的那条保持原样"
+
+
+def test_normalize_keeps_the_raw_string_and_leaves_decoding_to_the_batch():
+    """留着原串才看得出是「混淆没解开」还是「页面真的没给薪资」。"""
+    assert _item("面议")["salary_raw"] == "面议"
+    assert _item(_pua("25-45K"))["salary_raw"] == _pua("25-45K")

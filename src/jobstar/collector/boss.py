@@ -13,6 +13,8 @@ import subprocess
 from pathlib import Path
 
 from jobstar.collector.parse import (
+    decode_obfuscated_salary,
+    decode_salaries,
     dedup,
     extract_job_id,
     normalize_list_item,
@@ -262,7 +264,10 @@ def fetch_list(*, keyword: str, city_code: str, pages: int = 1) -> list[dict]:
         raw_items = payload.get("items", [])
         body_snippet = payload.get("body_snippet", "")
         _guard_login_body(body_snippet)
-        normalized = [i for i in (normalize_list_item(r) for r in raw_items) if i]
+        # 整页一起解码薪资：映射疑似变了就整批退回原串（见 decode_salaries）
+        normalized = decode_salaries(
+            [i for i in (normalize_list_item(r) for r in raw_items) if i]
+        )
         if not normalized:
             if _looks_like_empty_result(body_snippet):
                 continue
@@ -346,7 +351,9 @@ def save_detail(conn: sqlite3.Connection, job_id: str, detail: dict) -> None:
     去重键保持一致。hr_name / salary_raw 只在详情页抓到真实（非空）值时才覆盖，
     避免用空字符串冲掉列表页阶段已经落库的值。"""
     hr_name = detail.get("hr_name") or ""
-    salary_raw = detail.get("salary_raw") or ""
+    # 详情页的薪资同样可能是混淆编码，走同一个解码器（解不出来就原样留着）
+    raw_salary = detail.get("salary_raw") or ""
+    salary_raw = decode_obfuscated_salary(raw_salary) or raw_salary
     address = (detail.get("address") or "").strip()
     coords = parse_coords(detail.get("coords"))
     lng, lat = coords if coords else (None, None)

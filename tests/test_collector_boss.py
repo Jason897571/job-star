@@ -321,3 +321,28 @@ def test_detail_extract_js_asks_for_address_and_coords():
     assert boss.SELECTORS["detail_coords"] in js
     assert "data-lat" in js, "坐标在 data-lat 属性里，不是 innerText"
     assert "address:" in js and "coords:" in js
+
+
+def test_fetch_list_decodes_the_obfuscated_salaries(monkeypatch):
+    """采集时必须真的调用 decode_salaries。不接这一步的话，薪资一路以私用区
+    编码存进库，预门禁的薪资规则形同虚设——而那条规则是唯一能在抓详情页
+    **之前**减少页面请求的地方。"""
+    pua = "".join(chr(0xE031 + int(c)) if c.isdigit() else c for c in "25-45K·14薪")
+    payload = json.dumps(
+        {
+            "items": [
+                {
+                    "url": "/job_detail/abc123~.html", "title": "后端",
+                    "company": "A", "city": "杭州·滨江区·长河",
+                    "salary": pua, "hr": "", "tags": ["3-5年"],
+                }
+            ],
+            "body_snippet": "岗位列表",
+        },
+        ensure_ascii=False,
+    )
+    monkeypatch.setattr(boss, "run_script", lambda script, timeout=180: "###DATA###" + payload)
+
+    (item,) = boss.fetch_list(keyword="后端", city_code="101210100", pages=1)
+    assert item["salary_raw"] == "25-45K·14薪", "拿到的还是混淆编码，说明没接解码"
+    assert item["district"] == "滨江区"
